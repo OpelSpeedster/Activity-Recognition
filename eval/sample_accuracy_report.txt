@@ -1,0 +1,38 @@
+
+NOTE: These scores come from hand-made synthetic keypoints. They test detector logic only;
+they are not real-world accuracy measurements and do not test the webcam or pose model.
+
+=== Evaluation report: fall ===
+  fall      TP=1   FP=0   FN=0    P=1.00  R=1.00  F1=1.00
+  fight     TP=0   FP=0   FN=0    P=0.00  R=0.00  F1=0.00
+  OVERALL   TP=1   FP=0   FN=0    P=1.00  R=1.00  F1=1.00
+
+=== Evaluation report: normal_walking ===
+  fall      TP=0   FP=0   FN=0    P=0.00  R=0.00  F1=0.00
+  fight     TP=0   FP=0   FN=0    P=0.00  R=0.00  F1=0.00
+  OVERALL   TP=0   FP=0   FN=0    P=0.00  R=0.00  F1=0.00
+  -> PASS (no false alarms)
+
+=== Evaluation report: sitting ===
+  fall      TP=0   FP=0   FN=0    P=0.00  R=0.00  F1=0.00
+  fight     TP=0   FP=0   FN=0    P=0.00  R=0.00  F1=0.00
+  OVERALL   TP=0   FP=0   FN=0    P=0.00  R=0.00  F1=0.00
+  -> PASS (no false alarms)
+
+=== Evaluation report: fight ===
+  fall      TP=0   FP=0   FN=0    P=0.00  R=0.00  F1=0.00
+  fight     TP=2   FP=0   FN=0    P=1.00  R=1.00  F1=1.00
+  OVERALL   TP=2   FP=0   FN=0    P=1.00  R=1.00  F1=1.00
+
+=== Evaluation report: two_people_passing ===
+  fall      TP=0   FP=0   FN=0    P=0.00  R=0.00  F1=0.00
+  fight     TP=0   FP=0   FN=0    P=0.00  R=0.00  F1=0.00
+  OVERALL   TP=0   FP=0   FN=0    P=0.00  R=0.00  F1=0.00
+  -> PASS (no false alarms)
+
+=== Aggregate across all synthetic scenarios ===
+
+=== Evaluation report: ALL SCENARIOS ===
+  overall   TP=1   FP=0   FN=0    P=1.00  R=1.00  F1=1.00
+  overall   TP=2   FP=0   FN=0    P=1.00  R=1.00  F1=1.00
+  OVERALL   TP=3   FP=0   FN=0    P=1.00  R=1.00  F1=1.00
