@@ -1,0 +1,15 @@
+.env
+.venv/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Runtime output (regenerated locally)
+frames/
+clips/
+logs/
+
+# Model weights (large binaries)
+*.pt
+!yolov8n-pose.pt

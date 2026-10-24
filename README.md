@@ -162,3 +162,108 @@ This sends a text summary of detector outputs to the configured API. Do not
 use this mode if you do not want event metadata sent to an external service.
 If the API call fails or returns an invalid response, the program uses the
 local rule agent instead.
+
+## Agentic second-opinion verification
+
+When `GROQ_API_KEY` is set in `.env`, a **high-risk decision that has been
+sustained for `VERIFY_MIN_HIGH_RISK_SECONDS` (default 2.0)** is also sent to a
+two-agent verifier on the Groq API. A **vision agent** (Qwen) receives the
+actual snapshot frame as an image plus the detector measurements, and a
+separate **decision agent** (GPT-OSS) turns that observation into an
+independent `{risk_level, action, reasoning, alert_message}` verdict that is
+compared against the local rule decision:
+
+- **Agree + high risk** -> a wa.me WhatsApp message and a `tel:` dialer link
+  with the evidence are opened for the designated authority. The message leads
+  with `alert_message`, the plain-language incident summary the decision agent
+  wrote, followed by the structured verdict lines.
+- **Disagree, or an agent fails / returns bad JSON / exceeds its timeout** ->
+  a review request wa.me link is opened for `REVIEWER_WHATSAPP_NUMBER`, and
+  the program pauses and asks you to type `approve` or `reject` in the
+  console. Approving continues the normal flow (escalating if risk is high);
+  rejecting skips the action.
+
+Every other frame runs the normal local path with **no network call**: a brief
+spike (one fall frame, a momentary density jump) never reaches the LLMs, and
+neither does medium risk. Set `VERIFY_MIN_HIGH_RISK_SECONDS=0` to verify every
+high-risk frame the moment it appears.
+
+Local rules remain the decision authority; the agents never override them and
+never choose actions on their own. Every comparison, including the verifier
+latency, is recorded in `logs/verification.csv` so the latency target can be
+tracked.
+
+### Setup
+
+One Groq key covers both agents. Create one at https://console.groq.com/keys,
+then in `.env`:
+
+```
+GROQ_API_KEY=gsk_your_key_here
+VISION_MODEL=qwen/qwen3.8-27b
+DECISION_MODEL=openai/gpt-oss-120b
+```
+
+Both defaults are live Groq model IDs and need no other configuration — the
+client is the standard `openai` SDK pointed at `https://api.groq.com/openai/v1`,
+so no extra dependency is required beyond what is already in
+`requirements.txt`.
+
+### The two agents
+
+The split is deliberate. The two jobs need different capabilities, and keeping
+them separate is what makes the comparison in `agents/verifier.py` meaningful:
+
+- **`VisionAgent`** — `qwen/qwen3.8-27b`, multimodal, 131K context. Returns a
+  factual observation (`scene`, `activity`, `people_count`, `risk_signals`,
+  `confidence`, `notes`) and **is never shown the local verdict**, so it cannot
+  echo the answer back. It is also told not to pick a risk level or an action;
+  that is the other agent's job. It uses `strict: false` structured outputs
+  because Groq only offers advisory schema enforcement for this model, so
+  `parse_observation` still has to tolerate an occasional malformed reply.
+- **`DecisionAgent`** — `openai/gpt-oss-120b`, text only, ~500 tps. Sees the
+  observation plus the detector measurements and returns an independent verdict
+  plus `alert_message`. It uses `strict: true`, which is constrained decoding
+  that **guarantees** the reply matches the schema, so a malformed verdict is
+  not a failure mode. It is also never shown the local verdict.
+
+Switch `DECISION_MODEL` to `openai/gpt-oss-20b` for a cheaper, weaker
+alternative, or change `VISION_MODEL` to another Groq multimodal model — the
+only hard requirement is that it accepts image input. Both agents degrade to
+`insufficient_output` on any failure, which routes to human review instead of
+killing the video loop.
+
+### Non-blocking verification
+
+With `VERIFY_ASYNC=1` (default) the verifier runs on a single worker thread and
+the video loop keeps reading frames instead of stalling for the duration of
+both agent calls. Verdicts are picked up on a later frame, and each one carries
+the evidence and decision from the frame that produced it. Only the newest
+pending frame is verified — a stale frame is not worth two slow LLM calls.
+
+Set `VERIFY_ASYNC=0` to verify inline (the original behavior), which blocks
+the loop for up to `2 * VERIFY_TIMEOUT_SECONDS`.
+
+`VERIFY_LATENCY_TARGET_MS` defaults to 2000 because both agents run on Groq at
+roughly 450-500 tps, so decode time should be well under a second.
+
+### Evidence delivery
+
+`wa.me` links are text-only, so a plain escalation message can only carry a
+file path. Set `EVIDENCE_SERVER_ENABLED=1` and `EVIDENCE_PUBLIC_HOST=<your
+LAN IP>` to start a small static server on `frames/` — the message then
+carries a tappable link so the authority sees the photo on their phone
+(same network required). Off by default.
+
+### Safety and limits
+
+This layer only notifies designated humans via `AUTHORITY_WHATSAPP_NUMBER`,
+`AUTHORITY_PHONE_NUMBER` and `REVIEWER_WHATSAPP_NUMBER` (digits only, country
+code included) — it still does **not** contact emergency services, and neither
+agent ever places a call or sends a message on its own. WhatsApp receiving is
+out of scope: `wa.me` is send-only, so approve/reject happens in the console.
+
+Set `ESCALATION_DRY_RUN=1` to print the links instead of opening them, or
+`VERIFY_ENABLED=0` to turn the whole layer off. If either agent call is slower
+than `VERIFY_TIMEOUT_SECONDS` it is treated as a failure and routed to human
+review rather than stalling the video loop.
