@@ -9,6 +9,7 @@ class RuleBasedAgent:
     def analyze(self, context):
         falls = context.get("falls", [])
         fights = context.get("fights", [])
+        inactivity = context.get("inactivity", [])
         crowd = context.get("crowd", {})
         prolonged = context.get("prolonged_risk", False)
 
@@ -35,11 +36,25 @@ class RuleBasedAgent:
                 "reasoning": "Possible fight-like movement; please review the clip.",
             }
 
+        if density_level == "medium":
+            return {
+                "risk_level": "medium",
+                "action": "alert",
+                "reasoning": "Crowd density medium; please review the scene.",
+            }
+
         if density_level == "high":
             return {
                 "risk_level": "medium",
                 "action": "alert",
                 "reasoning": "Crowd density high",
+            }
+
+        if inactivity:
+            return {
+                "risk_level": "medium",
+                "action": "human_review",
+                "reasoning": "Prolonged inactivity candidate; please review the clip.",
             }
 
         if prolonged:

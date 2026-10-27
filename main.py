@@ -9,6 +9,7 @@ Run:
 import argparse
 import json
 import time
+from datetime import datetime
 from collections import deque
 from pathlib import Path
 
@@ -63,6 +64,9 @@ from config import (
 	SAVE_CLIP_ON_HIGH_RISK,
 	SAVE_SCREENSHOT_ON_HIGH_RISK,
 	TRACK_MAX_DISTANCE_RATIO,
+	TELEGRAM_BOT_TOKEN,
+	TELEGRAM_CHAT_ID,
+	TELEGRAM_TIMEOUT_SECONDS,
 	TRACK_MAX_LOST,
 	VISION_MAX_TOKENS,
 	VISION_MODEL,
@@ -82,17 +86,15 @@ from detectors.density_estimator import DensityEstimator
 from detectors.fall_detector import FallDetector
 from detectors.fight_detector import FightDetector
 from detectors.pose_estimator import PoseEstimator
-from utils.action_executor import ActionExecutor
-from utils.clip_buffer import ClipBuffer
+from utils.clip_buffer import ClipBuffer, sample_event_frames
 from utils.draw_utils import draw_boxes, draw_poses, draw_status
-from utils.escalation import EscalationNotifier, ReviewerNotifier
-from utils.evidence_server import EvidenceServer
 from utils.event_logger import EventLogger
 from utils.simple_tracker import SimpleTracker
 from utils.video_input import VideoSource
 from utils.model_profile import resolve_pose_profile
+from utils.telegram_notifier import TelegramNotifier
 from utils.verification_logger import VerificationLogger
-from utils.verify_queue import AsyncVerifier
+from utils.verify_queue import AsyncIncidentPipeline
 
 
 def parse_args():
@@ -116,12 +118,7 @@ def analyze_with_fallback(agent, fallback_agent, context):
 
 
 def build_judge():
-	"""Builds the Groq two-agent verifier, or returns None to skip it.
-
-	A vision agent (Qwen) looks at the snapshot, a decision agent (GPT-OSS)
-	turns that into an independent verdict plus the WhatsApp alert text. The
-	local rules stay the authority; this is only the second opinion.
-	"""
+	"""Build the Groq event reviewer, or return None when disabled/unconfigured."""
 	if not VERIFY_ENABLED:
 		return None
 	if not GROQ_API_KEY:
@@ -160,6 +157,93 @@ def should_verify(judge, decision, high_risk_seconds):
 	if decision.get("risk_level") != "high":
 		return False
 	return high_risk_seconds >= VERIFY_MIN_HIGH_RISK_SECONDS
+
+
+def should_review_rule_decision(decision):
+    return decision.get("action", "none") != "none"
+
+
+def submit_rule_candidate(decision, incident, pipeline):
+    if not should_review_rule_decision(decision):
+        return False
+    return pipeline.submit(incident)
+
+
+def is_new_event(event_key, now, last_seen, cooldown):
+    if now - last_seen.get(event_key, float("-inf")) < cooldown:
+        return False
+    last_seen[event_key] = now
+    return True
+
+
+def local_candidate_key(context):
+    context = context or {}
+    crowd = context.get("crowd") or {}
+    candidates = [
+        ("possible_fall", context.get("falls") or []),
+        ("fight_like_movement", context.get("fights") or []),
+        ("crowd_density", crowd.get("level") in {"medium", "high"}),
+        ("inactivity", context.get("inactivity") or []),
+    ]
+    for alert_type, evidence in candidates:
+        if evidence:
+            first = evidence[0] if isinstance(evidence, list) else {}
+            return alert_type, first.get("track_id") if isinstance(first, dict) else None
+    return "uncertain", None
+
+
+def build_telegram_notifier():
+    notifier = TelegramNotifier(
+        TELEGRAM_BOT_TOKEN,
+        TELEGRAM_CHAT_ID,
+        timeout=TELEGRAM_TIMEOUT_SECONDS,
+    )
+    if not notifier.configured:
+        print("[INFO] Telegram credentials not set; reviewer notifications are disabled")
+    return notifier
+
+
+def submit_completed_clips(completed, clip_buffer, incident_pipeline, event_logger):
+    for clip in completed:
+        try:
+            samples = sample_event_frames(
+                clip["frames"], clip["trigger_index"],
+                clip_buffer.pre_count, clip_buffer.post_count,
+            )
+        except ValueError:
+            samples = []
+        incident = {
+            **clip["metadata"],
+            "event_id": clip["event_id"],
+            "clip_path": clip["clip_path"],
+            "frames": samples,
+        }
+        if not submit_rule_candidate(incident["local_decision"], incident, incident_pipeline):
+            event_logger.log_event("review_queue_full", "warning", incident["event_id"])
+        else:
+            event_logger.log_event(
+                "event_clip_ready", incident["local_decision"].get("risk_level", ""),
+                incident.get("clip_path", ""),
+            )
+
+
+def drain_incident_results(incident_pipeline, verification_logger, event_logger):
+    result = incident_pipeline.poll()
+    while result is not None:
+        verification_logger.log_event_result(result)
+        review = result.get("review") or {}
+        delivery = result.get("delivery") or {}
+        if review.get("status") != "ok":
+            event_logger.log_event(
+                "ai_review_failed", "warning",
+                f"{result.get('event_id', '')}: {review.get('reason', 'review unavailable')}",
+            )
+        if delivery.get("error") and delivery.get("error") != "low risk":
+            event_logger.log_event(
+                "telegram_delivery_failed", "warning",
+                f"{result.get('event_id', '')}: {delivery['error']}",
+            )
+        result = incident_pipeline.poll()
 
 
 def request_human_approval(local_decision, verify_result, evidence, reviewer_notifier=None):
@@ -297,9 +381,6 @@ def process_frame(frame, pipeline, clip_buffer):
 	(frame, stateful detectors) -> (poses, events, density) for testability."""
 	pose_estimator, fall_detector, fight_detector, density_estimator, tracker = pipeline
 
-	if clip_buffer:
-		clip_buffer.add(frame)
-
 	detections, keypoints_list = pose_estimator.estimate(frame)
 	detections = tracker.update(detections, frame.shape)
 	poses = [
@@ -325,220 +406,137 @@ def process_frame(frame, pipeline, clip_buffer):
 
 
 def main():
-	args = parse_args()
-	model_path, device, image_size = resolve_pose_profile(args.device, args.model, args.imgsz)
-	print(f"[INFO] YOLO pose model={model_path}, device={device}, imgsz={image_size}, conf={YOLO_POSE_CONF}, iou={YOLO_POSE_IOU}")
+    args = parse_args()
+    model_path, device, image_size = resolve_pose_profile(args.device, args.model, args.imgsz)
+    print(f"[INFO] YOLO pose model={model_path}, device={device}, imgsz={image_size}, conf={YOLO_POSE_CONF}, iou={YOLO_POSE_IOU}")
 
-	LOG_DIR.mkdir(parents=True, exist_ok=True)
-	FRAME_DIR.mkdir(parents=True, exist_ok=True)
-	CLIP_DIR.mkdir(parents=True, exist_ok=True)
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    FRAME_DIR.mkdir(parents=True, exist_ok=True)
+    CLIP_DIR.mkdir(parents=True, exist_ok=True)
 
-	if args.source == "webcam":
-		video = VideoSource.from_webcam(args.camera, target_fps=CAMERA_FPS)
-	else:
-		source_path = Path(args.source)
-		if not source_path.exists():
-			raise FileNotFoundError(f"Video file not found: {source_path}")
-		video = VideoSource.from_file(str(source_path))
+    if args.source == "webcam":
+        video = VideoSource.from_webcam(args.camera, target_fps=CAMERA_FPS)
+    else:
+        source_path = Path(args.source)
+        if not source_path.exists():
+            raise FileNotFoundError(f"Video file not found: {source_path}")
+        video = VideoSource.from_file(str(source_path))
 
-	pipeline = build_pipeline(args, model_path, device, image_size)
-	event_logger = EventLogger(LOG_DIR, FRAME_DIR)
-	action_executor = ActionExecutor(event_logger, cooldown_seconds=ACTION_COOLDOWN_SECONDS)
-	clip_buffer = ClipBuffer(video.fps, CLIP_SECONDS, CLIP_DIR) if SAVE_CLIP_ON_HIGH_RISK else None
+    detector_pipeline = build_pipeline(args, model_path, device, image_size)
+    event_logger = EventLogger(LOG_DIR, FRAME_DIR)
+    # Event clips are required for Telegram delivery even when the legacy
+    # SAVE_CLIP_ON_HIGH_RISK option is disabled.
+    clip_buffer = ClipBuffer(video.fps, CLIP_SECONDS, CLIP_DIR)
+    event_verifier = build_judge()
+    telegram_notifier = build_telegram_notifier()
+    incident_pipeline = AsyncIncidentPipeline(event_verifier, telegram_notifier)
+    verification_logger = VerificationLogger(LOG_DIR)
 
-	judge = build_judge()
-	async_verifier = AsyncVerifier(judge) if (judge and VERIFY_ASYNC) else None
-	if async_verifier is not None:
-		print("[INFO] Verifier running async; the video loop will not stall")
+    rule_agent = RuleBasedAgent()
+    if args.agent == "llm":
+        try:
+            agent = CrowdSafetyAgent(OPENAI_API_KEY, model=AGENT_MODEL, temperature=AGENT_TEMPERATURE)
+        except Exception as exc:
+            print(f"[WARN] LLM agent unavailable, using rule-based agent: {exc}")
+            agent = rule_agent
+    else:
+        agent = rule_agent
 
-	# Optional LAN server so the wa.me message carries a photo link, not a path.
-	evidence_server = EvidenceServer(
-		FRAME_DIR, port=EVIDENCE_SERVER_PORT, public_host=EVIDENCE_PUBLIC_HOST
-	)
-	evidence_base_url = ""
-	if EVIDENCE_SERVER_ENABLED and evidence_server.start():
-		evidence_base_url = (
-			f"http://{EVIDENCE_PUBLIC_HOST}:{evidence_server.bound_port}"
-			if EVIDENCE_PUBLIC_HOST
-			else ""
-		)
-		if EVIDENCE_SERVER_ENABLED and not EVIDENCE_PUBLIC_HOST:
-			print(
-				"[WARN] EVIDENCE_PUBLIC_HOST not set; escalation messages will "
-				"carry file paths instead of photo links"
-			)
+    display = DISPLAY_WINDOW and not args.no_display
+    recent_events = deque(maxlen=RECENT_EVENT_HISTORY)
+    last_decision = {"risk_level": "low", "action": "none", "reasoning": "No risk"}
+    risk_streak = 0
+    frame_id = 0
+    last_seen = {}
 
-	notifier = EscalationNotifier(
-		AUTHORITY_WHATSAPP_NUMBER,
-		AUTHORITY_PHONE_NUMBER,
-		cooldown_seconds=ESCALATION_COOLDOWN_SECONDS,
-		dry_run=ESCALATION_DRY_RUN,
-		evidence_base_url=evidence_base_url,
-	)
-	if not notifier.configured:
-		print("[INFO] Authority numbers not set; escalation notifications are disabled")
+    while True:
+        frame = video.get_frame()
+        if frame is None:
+            break
+        frame_id += 1
 
-	reviewer_notifier = ReviewerNotifier(
-		REVIEWER_WHATSAPP_NUMBER,
-		cooldown_seconds=REVIEW_REQUEST_COOLDOWN_SECONDS,
-		dry_run=ESCALATION_DRY_RUN,
-		evidence_base_url=evidence_base_url,
-	)
-	if not reviewer_notifier.configured:
-		print("[INFO] Reviewer number not set; review requests go to the console only")
+        detections, poses, events, density, falls, fights, inactivity = process_frame(
+            frame, detector_pipeline, clip_buffer
+        )
+        if events:
+            for event in events:
+                recent_events.append(event["type"])
+                event_logger.log_event(event["type"], "info", json.dumps(event["data"]))
 
-	verification_logger = VerificationLogger(LOG_DIR)
+        risk_streak = risk_streak + 1 if (events or density["level"] != "low") else 0
+        prolonged_risk = risk_streak >= RISK_HIGH_STREAK_FRAMES
+        context = {
+            "frame_id": frame_id,
+            "timestamp": time.time(),
+            "crowd": density,
+            "falls": falls,
+            "fights": fights,
+            "inactivity": inactivity,
+            "prolonged_risk": prolonged_risk,
+            "recent_events": list(recent_events),
+        }
+        event_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-	rule_agent = RuleBasedAgent()
-	if args.agent == "llm":
-		try:
-			agent = CrowdSafetyAgent(OPENAI_API_KEY, model=AGENT_MODEL, temperature=AGENT_TEMPERATURE)
-		except Exception as exc:
-			print(f"[WARN] LLM agent unavailable, using rule-based agent: {exc}")
-			agent = rule_agent
-	else:
-		agent = rule_agent
+        # Add the current frame once before triggering, so it becomes the
+        # event-centered clip's final pre-roll frame.
+        ready_clips = clip_buffer.add(frame)
+        rule_decision = rule_agent.analyze(context)
+        if should_review_rule_decision(rule_decision):
+            alert_type, track_id = local_candidate_key(context)
+            track_key = str(track_id) if track_id is not None else "camera"
+            event_key = (alert_type, track_key)
+            if is_new_event(event_key, time.monotonic(), last_seen, ACTION_COOLDOWN_SECONDS):
+                event_id = f"{alert_type}-{track_key}-{frame_id}"
+                metadata = {
+                    "frame_id": frame_id,
+                    "context": context,
+                    "local_decision": rule_decision,
+                    "local_alert_type": alert_type,
+                    "timestamp": event_timestamp,
+                }
+                if clip_buffer.trigger(event_id, metadata):
+                    event_logger.log_event(
+                        "rule_candidate", rule_decision.get("risk_level", ""), event_id
+                    )
+        submit_completed_clips(ready_clips, clip_buffer, incident_pipeline, event_logger)
 
-	display = DISPLAY_WINDOW and not args.no_display
-	recent_events = deque(maxlen=RECENT_EVENT_HISTORY)
-	last_decision = {"risk_level": "low", "action": "none", "reasoning": "No risk"}
-	risk_streak = 0
-	high_risk_streak = 0
-	frame_id = 0
+        should_call_agent = bool(events) or frame_id % AGENT_CALL_EVERY_N_FRAMES == 0
+        if should_call_agent:
+            decision = analyze_with_fallback(agent, rule_agent, context)
+            last_decision = decision
+            if decision.get("risk_level") == "high" and SAVE_SCREENSHOT_ON_HIGH_RISK:
+                event_logger.log_event(
+                    "risk_high", "high", decision.get("reasoning", ""), frame=frame
+                )
+                if SAVE_CLIP_ON_HIGH_RISK:
+                    clip_path = clip_buffer.save_clip("high_risk")
+                    if clip_path:
+                        event_logger.log_event("clip_saved", "high", clip_path)
 
-	while True:
-		frame = video.get_frame()
-		if frame is None:
-			break
-		frame_id += 1
+        drain_incident_results(incident_pipeline, verification_logger, event_logger)
 
-		detections, poses, events, density, falls, fights, inactivity = process_frame(frame, pipeline, clip_buffer)
+        if display:
+            draw_boxes(frame, detections)
+            draw_poses(frame, poses)
+            status_lines = [
+                f"People: {density['count']}",
+                f"Density: {density['density']:.2f} ({density['level']})",
+                f"Risk: {last_decision['risk_level']} | Action: {last_decision['action']}",
+            ]
+            draw_status(frame, status_lines)
+            cv2.imshow("Crowd Safety", frame)
+            if cv2.waitKey(1) & 0xFF == ord("q"):
+                break
 
-		if events:
-			for event in events:
-				recent_events.append(event["type"])
-				event_logger.log_event(event["type"], "info", json.dumps(event["data"]))
+    submit_completed_clips(
+        clip_buffer.flush_pending(), clip_buffer, incident_pipeline, event_logger
+    )
+    incident_pipeline.shutdown(wait=True)
+    drain_incident_results(incident_pipeline, verification_logger, event_logger)
 
-		risk_streak = risk_streak + 1 if (events or density["level"] != "low") else 0
-		prolonged_risk = risk_streak >= RISK_HIGH_STREAK_FRAMES
-		# How long the most recent decision has been high risk. This is what
-		# gates the agentic verifier, so a one-frame spike costs nothing and
-		# only a sustained high-risk situation reaches the LLMs.
-		high_risk_streak = high_risk_streak + 1 if last_decision["risk_level"] == "high" else 0
-		should_call_agent = events or (frame_id % AGENT_CALL_EVERY_N_FRAMES == 0)
-
-		if should_call_agent:
-			context = {
-				"frame_id": frame_id,
-				"timestamp": time.time(),
-				"crowd": density,
-				"falls": falls,
-				"fights": fights,
-				"inactivity": inactivity,
-				"prolonged_risk": prolonged_risk,
-				"recent_events": list(recent_events),
-			}
-			decision = analyze_with_fallback(agent, rule_agent, context)
-			last_decision = decision
-
-			# Save evidence BEFORE verification so escalation can reference it.
-			evidence = {"frame_path": "", "clip_path": ""}
-			if decision["risk_level"] == "high" and SAVE_SCREENSHOT_ON_HIGH_RISK:
-				evidence["frame_path"] = event_logger.log_event("risk_high", "high", decision["reasoning"], frame=frame)
-				if clip_buffer and SAVE_CLIP_ON_HIGH_RISK:
-					clip_path = clip_buffer.save_clip("high_risk")
-					if clip_path:
-						evidence["clip_path"] = clip_path
-						event_logger.log_event("clip_saved", "high", clip_path)
-
-			# Second-opinion verification is gated on sustained high risk; see
-			# should_verify(). Everything else -- medium risk, a brief spike,
-			# or no risk at all -- runs the normal local path with no network
-			# call.
-			high_risk_seconds = high_risk_streak / max(CAMERA_FPS, 1)
-			verified_here = should_verify(judge, decision, high_risk_seconds)
-			if verified_here:
-				if async_verifier is not None:
-					# Non-blocking: verdict is picked up on a later frame.
-					async_verifier.submit(frame_id, frame, context, decision, evidence)
-				else:
-					handle_verify_result(
-						judge.verify(frame, context, decision),
-						decision,
-						evidence,
-						frame_id,
-						notifier,
-						reviewer_notifier,
-						action_executor,
-						event_logger,
-						verification_logger,
-					)
-
-			if not verified_here:
-				handle_unverified_decision(
-					decision, evidence, frame, notifier, action_executor, event_logger
-				)
-
-		# Drain any verdict the background judge has already finished. The job
-		# carries its own frame_id/decision/evidence, so it is judged against
-		# the frame that produced it, not the current one.
-		if async_verifier is not None:
-			finished = async_verifier.poll()
-			if finished is not None:
-				handle_verify_result(
-					finished["result"],
-					finished["decision"],
-					finished["evidence"],
-					finished["frame_id"],
-					notifier,
-					reviewer_notifier,
-					action_executor,
-					event_logger,
-					verification_logger,
-				)
-
-		if display:
-			draw_boxes(frame, detections)
-			draw_poses(frame, poses)
-			status_lines = [
-				f"People: {density['count']}",
-				f"Density: {density['density']:.2f} ({density['level']})",
-				f"Risk: {last_decision['risk_level']} | Action: {last_decision['action']}",
-			]
-			draw_status(frame, status_lines)
-			cv2.imshow("Crowd Safety", frame)
-			if cv2.waitKey(1) & 0xFF == ord("q"):
-				break
-
-	# Collect verdicts still in flight. File runs would otherwise drop the
-	# last few events, since their decisions never got a frame to land on.
-	if async_verifier is not None:
-		# Two sequential agent calls (vision, then decision) share one job.
-		drain_deadline = time.time() + (2 * VERIFY_TIMEOUT_SECONDS) + 1.0
-		while time.time() < drain_deadline:
-			finished = async_verifier.poll()
-			if finished is not None:
-				handle_verify_result(
-					finished["result"],
-					finished["decision"],
-					finished["evidence"],
-					finished["frame_id"],
-					notifier,
-					reviewer_notifier,
-					action_executor,
-					event_logger,
-					verification_logger,
-				)
-				continue
-			if not async_verifier.in_flight:
-				break
-			time.sleep(0.05)
-		async_verifier.shutdown(wait=False)
-
-	video.release()
-	if display:
-		cv2.destroyAllWindows()
-	evidence_server.stop()
+    video.release()
+    if display:
+        cv2.destroyAllWindows()
 
 
 if __name__ == "__main__":

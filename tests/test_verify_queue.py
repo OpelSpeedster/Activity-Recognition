@@ -2,7 +2,7 @@ import threading
 import time
 import unittest
 
-from utils.verify_queue import AsyncVerifier
+from utils.verify_queue import AsyncIncidentPipeline, AsyncVerifier
 
 CONTEXT = {"crowd": {"count": 1, "density": 0.1, "level": "low"}, "falls": []}
 LOCAL = {"risk_level": "high", "action": "human_review", "reasoning": "fall"}
@@ -160,6 +160,123 @@ class TestAsyncVerifier(unittest.TestCase):
         finally:
             verifier.shutdown()
 
+
+
+def make_incident(event_id):
+    return {
+        "event_id": event_id,
+        "frame_id": 10,
+        "context": {"event_id": event_id},
+        "local_decision": {"risk_level": "high", "action": "human_review", "reasoning": "fall"},
+        "local_alert_type": "possible_fall",
+        "clip_path": f"{event_id}.mp4",
+        "timestamp": "2026-10-27 10:00:00",
+        "frames": [make_frame() for _ in range(3)],
+    }
+
+
+class FakeEventVerifier:
+    def review_event_encoded(self, images, context):
+        return {"status": "ok", "model_decision": {"alert_type": "possible_fall", "risk_level": "high", "summary": context["event_id"]}}
+
+
+class RaisingEventVerifier:
+    def review_event_encoded(self, images, context):
+        raise RuntimeError("Groq timeout")
+
+
+class LowRiskEventVerifier:
+    def review_event_encoded(self, images, context):
+        return {"status": "ok", "model_decision": {"alert_type": "possible_fall", "risk_level": "low", "summary": "No visible risk."}}
+
+
+class FakeEventNotifier:
+    def __init__(self):
+        self.sent = []
+
+    def send_event(self, decision, clip_path, timestamp):
+        self.sent.append((decision, clip_path))
+        return {"video_sent": True, "text_sent": False, "error": ""}
+
+
+def collect_until(pipeline, count, timeout=3.0):
+    deadline = time.monotonic() + timeout
+    results = []
+    while len(results) < count and time.monotonic() < deadline:
+        result = pipeline.poll()
+        if result is not None:
+            results.append(result)
+        else:
+            time.sleep(0.005)
+    return results
+
+
+class GatedEventVerifier:
+    def __init__(self, gate, started):
+        self.gate = gate
+        self.started = started
+
+    def review_event_encoded(self, images, context):
+        self.started.set()
+        self.gate.wait(timeout=3.0)
+        return {"status": "ok", "model_decision": {"alert_type": "possible_fall", "risk_level": "high", "summary": context["event_id"]}}
+
+class TestAsyncIncidentPipeline(unittest.TestCase):
+    def test_queue_is_bounded_and_shutdown_drains_accepted_events(self):
+        gate = threading.Event()
+        started = threading.Event()
+        notifier = FakeEventNotifier()
+        pipeline = AsyncIncidentPipeline(GatedEventVerifier(gate, started), notifier, max_pending=2)
+        try:
+            self.assertTrue(pipeline.submit(make_incident("event-1")))
+            self.assertTrue(started.wait(timeout=1.0))
+            self.assertTrue(pipeline.submit(make_incident("event-2")))
+            self.assertFalse(pipeline.submit(make_incident("event-3")))
+            gate.set()
+            pipeline.shutdown(wait=True)
+            results = []
+            while True:
+                result = pipeline.poll()
+                if result is None:
+                    break
+                results.append(result)
+            self.assertEqual([result["event_id"] for result in results], ["event-1", "event-2"])
+        finally:
+            gate.set()
+            pipeline.shutdown()
+    def test_pipeline_preserves_distinct_event_ids_in_fifo_order(self):
+        notifier = FakeEventNotifier()
+        pipeline = AsyncIncidentPipeline(FakeEventVerifier(), notifier)
+        try:
+            self.assertTrue(pipeline.submit(make_incident("event-1")))
+            self.assertTrue(pipeline.submit(make_incident("event-2")))
+            results = collect_until(pipeline, count=2)
+            self.assertEqual([result["event_id"] for result in results], ["event-1", "event-2"])
+            self.assertEqual(len(notifier.sent), 2)
+        finally:
+            pipeline.shutdown()
+
+    def test_model_failure_sends_local_fallback_and_clip(self):
+        notifier = FakeEventNotifier()
+        pipeline = AsyncIncidentPipeline(RaisingEventVerifier(), notifier)
+        try:
+            pipeline.submit(make_incident("event-3"))
+            result = collect_until(pipeline, count=1)[0]
+            self.assertIn("AI review unavailable", result["decision"]["summary"])
+            self.assertEqual(notifier.sent[0][1], "event-3.mp4")
+        finally:
+            pipeline.shutdown()
+
+    def test_low_risk_result_is_logged_without_telegram_send(self):
+        notifier = FakeEventNotifier()
+        pipeline = AsyncIncidentPipeline(LowRiskEventVerifier(), notifier)
+        try:
+            pipeline.submit(make_incident("event-4"))
+            result = collect_until(pipeline, count=1)[0]
+            self.assertEqual(result["decision"]["risk_level"], "low")
+            self.assertEqual(notifier.sent, [])
+        finally:
+            pipeline.shutdown()
 
 if __name__ == "__main__":
     unittest.main()

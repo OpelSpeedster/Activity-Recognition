@@ -1,8 +1,12 @@
+import csv
 import unittest
+from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 import main
+from agents.rule_agent import RuleBasedAgent
 from agents.verifier import INSUFFICIENT
+from utils.verification_logger import VerificationLogger
 
 CONTEXT = {"crowd": {"count": 2, "density": 0.1, "level": "low"}, "falls": []}
 EVIDENCE = {"frame_path": "frames/a.jpg", "clip_path": ""}
@@ -277,6 +281,79 @@ class TestJudgeSelection(unittest.TestCase):
             )
         self.assertEqual(notifier.alert_messages[0], "")
 
+
+
+class RecordingPipeline:
+    def __init__(self):
+        self.submitted = []
+
+    def submit(self, incident):
+        self.submitted.append(incident)
+        return True
+
+
+class TestRuleEventGate(unittest.TestCase):
+    def test_none_rule_action_does_not_submit(self):
+        pipeline = RecordingPipeline()
+        incident = {"event_id": "event-1"}
+        self.assertFalse(main.submit_rule_candidate(LOCAL_LOW, incident, pipeline))
+        self.assertEqual(pipeline.submitted, [])
+
+    def test_non_none_rule_action_submits_candidate(self):
+        pipeline = RecordingPipeline()
+        incident = {"event_id": "event-1"}
+        self.assertTrue(main.submit_rule_candidate(LOCAL_HIGH, incident, pipeline))
+        self.assertEqual(pipeline.submitted, [incident])
+
+    def test_same_event_is_deduplicated_within_cooldown(self):
+        last_seen = {}
+        key = ("possible_fall", "track-7")
+        self.assertTrue(main.is_new_event(key, 10.0, last_seen, cooldown=5.0))
+        self.assertFalse(main.is_new_event(key, 12.0, last_seen, cooldown=5.0))
+        self.assertTrue(main.is_new_event(key, 16.0, last_seen, cooldown=5.0))
+
+    def test_local_candidate_key_matches_deterministic_priority(self):
+        context = {
+            "falls": [],
+            "fights": [],
+            "crowd": {"level": "medium"},
+            "inactivity": [{"track_id": 8}],
+        }
+        self.assertEqual(main.local_candidate_key(context), ("crowd_density", None))
+        context["crowd"]["level"] = "low"
+        self.assertEqual(main.local_candidate_key(context), ("inactivity", 8))
+
+    def test_inactivity_rule_creates_a_deterministic_candidate(self):
+        decision = RuleBasedAgent().analyze({
+            "falls": [], "fights": [], "crowd": {"level": "low"},
+            "inactivity": [{"track_id": 5}], "prolonged_risk": False,
+        })
+        self.assertEqual(decision["action"], "human_review")
+
+
+class TestEventVerificationLogging(unittest.TestCase):
+    def test_event_result_and_legacy_rows_use_the_expanded_header(self):
+        with TemporaryDirectory() as directory:
+            logger = VerificationLogger(directory)
+            logger.log_event_result({
+                "event_id": "possible_fall-7-10",
+                "frame_id": 10,
+                "timestamp": "2026-10-27 10:00:00",
+                "local_decision": LOCAL_HIGH,
+                "review": {"status": "ok", "latency_ms": 12.3, "model": "fake-model", "reason": ""},
+                "decision": {"alert_type": "possible_fall", "risk_level": "high", "summary": "Person on floor."},
+                "delivery": {"video_sent": True, "text_sent": False, "error": ""},
+            })
+            logger.log(11, LOCAL_HIGH, {"agreement": "agreement", "model_decision": LOCAL_HIGH}, "", "agreement_high")
+            with open(logger.log_path, "r", newline="", encoding="utf-8") as file:
+                rows = list(csv.DictReader(file))
+
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["alert_type"], "possible_fall")
+        self.assertEqual(rows[0]["telegram_status"], "video_sent")
+        self.assertEqual(rows[0]["summary"], "Person on floor.")
+        self.assertEqual(rows[1]["outcome"], "agreement_high")
+        self.assertTrue(all(len(row) == len(VerificationLogger.FIELDS) for row in rows))
 
 if __name__ == "__main__":
     unittest.main()

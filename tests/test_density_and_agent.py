@@ -45,6 +45,17 @@ class TestRuleBasedAgent(unittest.TestCase):
         self.assertEqual(decision["action"], "human_review")
         self.assertEqual(decision["risk_level"], "medium")
 
+    def test_medium_density_requests_review(self):
+        context = {"falls": [], "fights": [], "crowd": {"level": "medium"}, "inactivity": [], "prolonged_risk": False}
+        decision = self.agent.analyze(context)
+        self.assertEqual(decision["action"], "alert")
+        self.assertEqual(decision["risk_level"], "medium")
+
+    def test_inactivity_requests_human_review(self):
+        context = {"falls": [], "fights": [], "crowd": {"level": "low"}, "inactivity": [{"track_id": 5}], "prolonged_risk": False}
+        decision = self.agent.analyze(context)
+        self.assertEqual(decision["action"], "human_review")
+        self.assertEqual(decision["risk_level"], "medium")
     def test_no_incidents_is_low_risk(self):
         context = {"falls": [], "fights": [], "crowd": {"level": "low"}, "prolonged_risk": False}
         decision = self.agent.analyze(context)
