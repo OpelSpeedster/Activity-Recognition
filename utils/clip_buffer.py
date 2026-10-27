@@ -22,9 +22,12 @@ class ClipBuffer:
     def __init__(self, fps, seconds, output_dir):
         self.fps = max(float(fps), 1.0)
         self.seconds = max(float(seconds), 1.0 / self.fps)
-        self.max_len = max(1, int(round(self.fps * self.seconds)))
         self.pre_count = max(0, round(self.fps * self.seconds / 2))
         self.post_count = self.pre_count
+        # Keep only the pre-event half (plus the trigger frame) in the rolling
+        # history. Retaining a full CLIP_SECONDS here would make the finalized
+        # clip roughly 1.5 times longer than configured after post-roll.
+        self.max_len = max(1, self.pre_count + 1)
         self.frames = deque(maxlen=self.max_len)
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)

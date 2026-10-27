@@ -28,18 +28,20 @@ class TestClipBuffer(unittest.TestCase):
         with TemporaryDirectory() as directory:
             buffer = ClipBuffer(fps=2, seconds=4, output_dir=Path(directory))
             with patch.object(ClipBuffer, "_write_event_clip", return_value="event.mp4"):
-                for value in range(5):
+                # Older frames outside the configured pre-event half must not
+                # lengthen the final clip.
+                for value in range(9):
                     buffer.add(marker(value))
                 self.assertTrue(buffer.trigger("event-1", metadata={"frame_id": 5}))
                 completed = []
-                for value in range(5, 9):
+                for value in range(9, 13):
                     completed.extend(buffer.add(marker(value)))
 
             self.assertEqual(len(completed), 1)
             record = completed[0]
             self.assertEqual(record["trigger_index"], 4)
             self.assertEqual(record["metadata"], {"frame_id": 5})
-            self.assertEqual([int(frame[0, 0, 0]) for frame in record["frames"]], list(range(9)))
+            self.assertEqual([int(frame[0, 0, 0]) for frame in record["frames"]], list(range(4, 13)))
 
     def test_flush_pending_writes_short_clip_at_end_of_input(self):
         with TemporaryDirectory() as directory:
