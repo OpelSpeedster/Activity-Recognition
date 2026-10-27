@@ -36,7 +36,7 @@ For candidates handled by this workflow, Telegram is the only outbound notificat
 
 ## Configuration and privacy
 
-Add `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` to the local `.env` setup and add blank placeholders to `.env.example`. Never commit tokens. The bot must be started by the reviewer and added to the destination chat before it can send there. Keep Telegram delivery disabled when either required setting is absent.
+Use the existing `GROQ_API_KEY` as the single key for both the Qwen VLM and GPT-OSS LLM clients; no separate model-provider keys are required. Both clients use Groq’s OpenAI-compatible endpoint. Add `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` to the local `.env` setup and add blank placeholders to `.env.example`. Never commit API tokens. The bot must be started by the reviewer and added to the destination chat before it can send there. Keep Telegram delivery disabled when either required Telegram setting is absent.
 
 Only three sampled event images and detector context go to Groq. The MP4 goes to the configured Telegram chat; it is not sent to Groq. Telegram messages are one-way notifications: the program does not poll for reviewer replies or treat replies as approval.
 
@@ -50,5 +50,3 @@ The design is satisfied when a no-alert local decision makes no Groq or Telegram
 
 - **Continuous vision review:** rejected because it would call Groq on routine frames and add latency and API traffic.
 - **Send the MP4 to Groq:** the current documented Groq vision interface uses image inputs. The chosen flow sends three sampled images to Groq and the full event clip to Telegram.
-
-
