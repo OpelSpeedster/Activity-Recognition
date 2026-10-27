@@ -143,6 +143,9 @@ ESCALATION_DRY_RUN = _get_bool("ESCALATION_DRY_RUN", False)
 HITL_PROMPT_ENABLED = _get_bool("HITL_PROMPT_ENABLED", True)
 # Reuse a cooldown so a repeating failure cannot spam the reviewer.
 REVIEW_REQUEST_COOLDOWN_SECONDS = _get_int("REVIEW_REQUEST_COOLDOWN_SECONDS", 60)
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+TELEGRAM_TIMEOUT_SECONDS = _get_int("TELEGRAM_TIMEOUT_SECONDS", 10)
 
 # ---------------------------------------------------------------------------
 # Evidence server: wa.me messages are text-only, so this tiny LAN static
