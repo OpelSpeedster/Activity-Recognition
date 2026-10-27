@@ -199,5 +199,44 @@ class TestExports(unittest.TestCase):
         self.assertTrue(callable(encode_frame_jpeg))
 
 
+class FakeVision:
+    def __init__(self, fail=False):
+        self.fail = fail
+
+    def observe_frames_encoded(self, images, context):
+        if self.fail:
+            raise RuntimeError("vision unavailable")
+        self.seen = (images, context)
+        return {"scene": "hall", "activity": "person on floor", "risk_signals": ["possible fall"]}
+
+
+class FakeDecision:
+    def classify_event(self, observation, context):
+        self.seen = (observation, context)
+        return {"alert_type": "possible_fall", "risk_level": "high", "summary": "Person on the floor."}
+
+
+class TestGroqEventReview(unittest.TestCase):
+    def make_verifier(self, vision):
+        verifier = GroqVerifier.__new__(GroqVerifier)
+        verifier.vision = vision
+        verifier.decision = FakeDecision()
+        verifier.model = "fake-decision"
+        return verifier
+
+    def test_review_event_passes_all_three_images_then_observation(self):
+        vision = FakeVision()
+        verifier = self.make_verifier(vision)
+        context = {"falls": [{"track_id": 7}]}
+        result = verifier.review_event_encoded(["A", "B", "C"], context)
+        self.assertEqual(vision.seen[0], ["A", "B", "C"])
+        self.assertEqual(verifier.decision.seen[0], result["observation"])
+        self.assertEqual(result["model_decision"]["alert_type"], "possible_fall")
+
+    def test_review_event_returns_error_if_vision_fails(self):
+        verifier = self.make_verifier(FakeVision(fail=True))
+        result = verifier.review_event_encoded(["A", "B", "C"], {})
+        self.assertEqual(result["status"], "error")
+
 if __name__ == "__main__":
     unittest.main()

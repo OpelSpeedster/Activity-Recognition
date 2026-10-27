@@ -288,5 +288,27 @@ class TestDecisionAgent(unittest.TestCase):
         self.assertNotIn("LOCAL_MARKER_XYZ", user_text)
 
 
+class TestEventReview(unittest.TestCase):
+    def test_vision_message_contains_three_images_in_order(self):
+        agent = make_agent(VisionAgent, "test-vision")
+        messages = agent.build_messages(["AAA", "BBB", "CCC"], FALL_CONTEXT)
+        parts = messages[1]["content"]
+        images = [part["image_url"]["url"] for part in parts if part["type"] == "image_url"]
+        self.assertEqual(images, [
+            "data:image/jpeg;base64,AAA",
+            "data:image/jpeg;base64,BBB",
+            "data:image/jpeg;base64,CCC",
+        ])
+
+    def test_event_decision_parser_validates_type_risk_and_summary(self):
+        from agents.groq_agents import parse_event_decision
+        decision = parse_event_decision(
+            '{"alert_type":"possible_fall","risk_level":"high",'
+            '"summary":"A person appears to be on the ground."}'
+        )
+        self.assertEqual(decision["alert_type"], "possible_fall")
+        self.assertEqual(decision["risk_level"], "high")
+        self.assertTrue(decision["summary"])
+
 if __name__ == "__main__":
     unittest.main()

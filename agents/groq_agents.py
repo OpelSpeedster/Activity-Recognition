@@ -28,6 +28,8 @@ DEFAULT_VISION_MODEL = "qwen/qwen3.8-27b"
 DEFAULT_DECISION_MODEL = "openai/gpt-oss-120b"
 
 CONFIDENCE_LEVELS = {"high", "medium", "low"}
+EVENT_TYPES = {"possible_fall", "fight_like_movement", "crowd_density", "inactivity", "uncertain"}
+EVENT_RISK_LEVELS = {"low", "medium", "high"}
 
 # qwen3.8-27b only supports strict:false, so the schema is advisory and the
 # tolerant parser below still has to cope with the odd malformed reply.
@@ -61,19 +63,34 @@ DECISION_SCHEMA = {
 
 VISION_SYSTEM_PROMPT = (
     "You are the observation agent of a crowd-safety system. You receive one "
-    "CCTV snapshot plus the raw measurements reported by on-site detectors.\n"
-    "Describe only what is visibly present. Treat the detector measurements as "
-    "uncertain candidates to check against the image, not as facts.\n"
-    "Report a fall, a fight, a collapse, a person on the ground, or dangerous "
-    "overcrowding only if you can see evidence of it.\n"
-    "Do not identify anyone, and do not infer a person's intent, identity, or "
-    "guilt. Do not choose a risk level or an action; a separate agent does "
-    "that.\n"
-    "Return only a JSON object with: scene (one line describing the setting), "
-    "activity (one line describing what is happening), people_count (integer), "
-    "risk_signals (array of short strings naming any hazard you can see, empty "
-    "if none), confidence (high|medium|low), notes (one line on anything that "
-    "limits what you can tell)."
+    "or more CCTV frames in chronological order, plus raw measurements from "
+    "on-site detectors. When three frames are provided, they show before, at, "
+    "and after a candidate event. Describe only what is visibly present and "
+    "how it changes across the frames. Treat detector measurements as uncertain "
+    "candidates to check, not as facts. Report hazards only when visible. Do "
+    "not identify anyone; do not infer a person's intent, identity, or guilt. Do not choose a "
+    "risk level or an action; a separate agent does that. Return only JSON with "
+    "scene, activity, people_count, risk_signals, confidence, and notes."
+)
+
+EVENT_DECISION_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "alert_type": {"type": "string", "enum": sorted(EVENT_TYPES)},
+        "risk_level": {"type": "string", "enum": sorted(EVENT_RISK_LEVELS)},
+        "summary": {"type": "string"},
+    },
+    "required": ["alert_type", "risk_level", "summary"],
+}
+
+EVENT_DECISION_SYSTEM_PROMPT = (
+    "You are the decision agent for a human-reviewed safety alert system. "
+    "Use the visual observation and detector context to choose exactly one "
+    "alert type: possible_fall, fight_like_movement, crowd_density, "
+    "inactivity, or uncertain. Choose risk low, medium, or high. Ground the "
+    "decision in visible evidence, keep the summary concise and factual, and "
+    "do not identify people, assign blame, or recommend emergency services. "
+    "Return only JSON with alert_type, risk_level, and summary."
 )
 
 DECISION_SYSTEM_PROMPT = (
@@ -156,15 +173,19 @@ def build_context_summary(context):
 
 
 def image_message(frame_jpeg_b64, text):
-    """Builds a user message carrying text plus the snapshot as a data URI."""
+    """Build a user message with one or more JPEG data-URI image blocks."""
+    images = [frame_jpeg_b64] if isinstance(frame_jpeg_b64, str) else list(frame_jpeg_b64 or [])
+    if len(images) == 3:
+        text = text + "\nImages are in order: before the event, event frame, after the event."
     content = [{"type": "text", "text": text}]
-    if frame_jpeg_b64:
-        content.append(
-            {
-                "type": "image_url",
-                "image_url": {"url": f"data:image/jpeg;base64,{frame_jpeg_b64}"},
-            }
-        )
+    for encoded in images:
+        if encoded:
+            content.append(
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/jpeg;base64,{encoded}"},
+                }
+            )
     return content
 
 
@@ -240,6 +261,27 @@ def parse_decision(content):
     }
 
 
+def parse_event_decision(content):
+    """Validate the structured event classification returned by GPT-OSS."""
+    data = parse_json_reply(content)
+    if not isinstance(data, dict):
+        raise ValueError("The event decision must be a JSON object")
+
+    alert_type = str(data.get("alert_type", "")).strip().lower()
+    if alert_type not in EVENT_TYPES:
+        raise ValueError(f"Invalid alert_type from decision agent: {alert_type!r}")
+
+    risk_level = str(data.get("risk_level", "")).strip().lower()
+    if risk_level not in EVENT_RISK_LEVELS:
+        raise ValueError(f"Invalid risk_level from decision agent: {risk_level!r}")
+
+    summary = str(data.get("summary", "")).strip()
+    if not summary:
+        raise ValueError("The decision agent returned an empty summary")
+
+    return {"alert_type": alert_type, "risk_level": risk_level, "summary": summary}
+
+
 def render_observation(observation):
     """Flattens an observation dict into the text the decision agent reads."""
     signals = observation.get("risk_signals") or []
@@ -287,7 +329,7 @@ class _GroqAgent:
 
 
 class VisionAgent(_GroqAgent):
-    """Looks at the snapshot and returns a factual, decision-free observation."""
+    """Looks at event frames and returns factual, decision-free observations."""
 
     def __init__(self, api_key, model=DEFAULT_VISION_MODEL, **kwargs):
         super().__init__(api_key, model, **kwargs)
@@ -300,15 +342,24 @@ class VisionAgent(_GroqAgent):
         ]
 
     def observe_encoded(self, frame_jpeg_b64, context):
-        """Returns a validated observation dict. Raises ValueError on junk."""
+        """Compatibility method for the existing one-image verifier."""
         content = self.create(
             self.build_messages(frame_jpeg_b64, context), VISION_SCHEMA, strict=False
         )
         return parse_observation(content)
 
+    def observe_frames_encoded(self, frame_jpegs_b64, context):
+        """Observe exactly three event-centered images in chronological order."""
+        images = list(frame_jpegs_b64 or [])
+        if len(images) != 3 or any(not image for image in images):
+            raise ValueError("event review requires three encoded frames")
+        content = self.create(
+            self.build_messages(images, context), VISION_SCHEMA, strict=False
+        )
+        return parse_observation(content)
 
 class DecisionAgent(_GroqAgent):
-    """Turns an observation into an independent verdict plus the WhatsApp text."""
+    """Produces a legacy verdict or a typed event classification."""
 
     def __init__(self, api_key, model=DEFAULT_DECISION_MODEL, **kwargs):
         super().__init__(api_key, model, **kwargs)
@@ -319,15 +370,32 @@ class DecisionAgent(_GroqAgent):
             {"role": "system", "content": DECISION_SYSTEM_PROMPT},
             {
                 "role": "user",
-                "content": (
-                    f"{render_observation(observation)}\n\n{text}"
-                ),
+                "content": render_observation(observation) + "\n\n" + text,
             },
         ]
 
     def decide(self, observation, context):
-        """Returns {risk_level, action, reasoning, alert_message}. Raises on junk."""
+        """Returns the legacy {risk_level, action, reasoning, alert_message}."""
         content = self.create(
             self.build_messages(observation, context), DECISION_SCHEMA, strict=True
         )
         return parse_decision(content)
+
+    def build_event_messages(self, observation, context):
+        text = build_context_summary(context)
+        return [
+            {"role": "system", "content": EVENT_DECISION_SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": render_observation(observation) + "\n\n" + text,
+            },
+        ]
+
+    def classify_event(self, observation, context):
+        """Return {alert_type, risk_level, summary} with schema validation."""
+        content = self.create(
+            self.build_event_messages(observation, context),
+            EVENT_DECISION_SCHEMA,
+            strict=True,
+        )
+        return parse_event_decision(content)

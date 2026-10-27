@@ -119,3 +119,28 @@ class GroqVerifier:
             )
 
         return self._result(status, model_decision, reason, started, observation)
+
+    def review_event_encoded(self, frame_jpegs_b64, context):
+        """Run Qwen over three event frames, then GPT-OSS for the alert decision."""
+        started = time.perf_counter()
+        observation = None
+        try:
+            observation = self.vision.observe_frames_encoded(frame_jpegs_b64, context)
+            model_decision = self.decision.classify_event(observation, context)
+        except Exception as exc:
+            return {
+                "status": "error",
+                "model_decision": None,
+                "observation": observation,
+                "reason": str(exc),
+                "latency_ms": (time.perf_counter() - started) * 1000.0,
+                "model": self.model,
+            }
+        return {
+            "status": "ok",
+            "model_decision": model_decision,
+            "observation": observation,
+            "reason": "",
+            "latency_ms": (time.perf_counter() - started) * 1000.0,
+            "model": self.model,
+        }
