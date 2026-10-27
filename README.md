@@ -23,17 +23,17 @@ by a trained person using approved procedures.
 
 ```text
 webcam or video
-      -> pose model finds people and body points
-      -> fall and fight-like movement rules check short sequences
-      -> crowd counter estimates people in the frame
-      -> rule agent chooses: no alert, alert, or human review
-      -> program logs the result and may save a clip
+      -> pose model and deterministic rules find candidate events
+      -> only a non-none rule action starts event review
+      -> save the before, event, and after clip
+      -> Qwen reviews three sampled images; GPT-OSS chooses type, risk, summary
+      -> Telegram sends the clip and alert to a human reviewer
 ```
 
-The rule agent is the best place to start: it is local, predictable, and does
-not need an API key. The optional LLM agent receives a short text summary of
-the detected events, not the video. Local rules choose the alert; the LLM can
-only add a short review note.
+The rule agent is local, predictable, and does not need an API key. It gates
+event review even when `--agent llm` is selected. The optional LLM mode is a
+separate text-only display suggestion; it cannot start a Telegram alert by
+itself. For event review, one Groq API key is shared by Qwen and GPT-OSS.
 
 ## Start here
 
@@ -110,9 +110,8 @@ model performance depend on the particular Pi, webcam, and scene.
 2. Read `main.py`: it connects the input, detectors, agent, and logger.
 3. Read `detectors/fall_detector.py`, then `detectors/fight_detector.py`.
    These are simple rules over pose estimates, not trained fight/fall models.
-4. Read `agents/rule_agent.py` to see how event candidates become review
-   alerts. `utils/action_executor.py` only prints and logs; it does not call
-   anyone.
+4. Read `agents/rule_agent.py` and `main.py` to see how deterministic
+   candidates become event clips, Groq reviews, and Telegram alerts.
 5. Change one threshold in `.env`, run again, and compare what changed.
 6. Label separate real clips and use the real-video evaluation below before
    making any claim about accuracy.
@@ -150,7 +149,7 @@ intended camera and scene.
 - `main.py` - connects the steps and runs the video loop.
 - `config.py` and `.env.example` - settings and thresholds.
 - `detectors/` - pose, fall, fight-like movement, and crowd-count logic.
-- `agents/` - local rules and optional text-only LLM suggestion.
+- `agents/` - deterministic rules, Groq event reviewers, and the optional text-only LLM suggestion.
 - `utils/` - camera input, tracking, clips, drawing, and event logs.
 - `eval/` - synthetic examples, real-video evaluation, and labeling guide.
 - `tests/` - small checks for individual pieces of logic.
@@ -163,107 +162,67 @@ use this mode if you do not want event metadata sent to an external service.
 If the API call fails or returns an invalid response, the program uses the
 local rule agent instead.
 
-## Agentic second-opinion verification
+## Groq event review and Telegram alerts
 
-When `GROQ_API_KEY` is set in `.env`, a **high-risk decision that has been
-sustained for `VERIFY_MIN_HIGH_RISK_SECONDS` (default 2.0)** is also sent to a
-two-agent verifier on the Groq API. A **vision agent** (Qwen) receives the
-actual snapshot frame as an image plus the detector measurements, and a
-separate **decision agent** (GPT-OSS) turns that observation into an
-independent `{risk_level, action, reasoning, alert_message}` verdict that is
-compared against the local rule decision:
+The event-review path runs after the deterministic `RuleBasedAgent` returns an
+action other than `none`. It creates an event-centered clip using
+`CLIP_SECONDS` (3 seconds by default), then samples an image from before, at,
+and after the candidate event. Qwen reviews those three images plus detector
+context; GPT-OSS returns an alert type, risk level, and short summary. The
+MP4 is sent to Telegram, not to Groq.
 
-- **Agree + high risk** -> a wa.me WhatsApp message and a `tel:` dialer link
-  with the evidence are opened for the designated authority. The message leads
-  with `alert_message`, the plain-language incident summary the decision agent
-  wrote, followed by the structured verdict lines.
-- **Disagree, or an agent fails / returns bad JSON / exceeds its timeout** ->
-  a review request wa.me link is opened for `REVIEWER_WHATSAPP_NUMBER`, and
-  the program pauses and asks you to type `approve` or `reject` in the
-  console. Approving continues the normal flow (escalating if risk is high);
-  rejecting skips the action.
-
-Every other frame runs the normal local path with **no network call**: a brief
-spike (one fall frame, a momentary density jump) never reaches the LLMs, and
-neither does medium risk. Set `VERIFY_MIN_HIGH_RISK_SECONDS=0` to verify every
-high-risk frame the moment it appears.
-
-Local rules remain the decision authority; the agents never override them and
-never choose actions on their own. Every comparison, including the verifier
-latency, is recorded in `logs/verification.csv` so the latency target can be
-tracked.
+Low-risk decisions are logged without a Telegram alert. Medium- and high-risk
+decisions, plus `uncertain`, are sent to the reviewer. If Groq is unavailable
+or the review fails, the system sends the deterministic candidate with an
+`AI review unavailable` note. If video upload fails or the clip is over
+Telegram's 50 MB Bot API limit, it sends a text notice with the upload failure.
+The person receiving the Telegram message reviews the clip and decides what to
+do. The app does not read Telegram replies or call emergency services.
 
 ### Setup
 
-One Groq key covers both agents. Create one at https://console.groq.com/keys,
-then in `.env`:
+One `GROQ_API_KEY` authenticates both Groq models. Copy `.env.example` to
+`.env`, create a Groq API key, create a Telegram bot with BotFather, and set the
+bot token and destination chat ID:
 
-```
+```dotenv
 GROQ_API_KEY=gsk_your_key_here
 VISION_MODEL=qwen/qwen3.8-27b
 DECISION_MODEL=openai/gpt-oss-120b
+TELEGRAM_BOT_TOKEN=your_bot_token
+TELEGRAM_CHAT_ID=your_chat_id
+TELEGRAM_TIMEOUT_SECONDS=10
 ```
 
-Both defaults are live Groq model IDs and need no other configuration — the
-client is the standard `openai` SDK pointed at `https://api.groq.com/openai/v1`,
-so no extra dependency is required beyond what is already in
-`requirements.txt`.
+Start the bot in a private chat (or add it to the review group) so it can send
+messages there. Keep `.env` private and never commit bot or Groq tokens. The
+model defaults already match the values above; set them only if you need to
+override a model. Both models use the existing OpenAI-compatible client pointed
+at Groq, so no additional SDK is needed.
 
-### The two agents
+Run a short video first:
 
-The split is deliberate. The two jobs need different capabilities, and keeping
-them separate is what makes the comparison in `agents/verifier.py` meaningful:
+```powershell
+python main.py --source path\to\your_video.mp4 --agent rule
+```
 
-- **`VisionAgent`** — `qwen/qwen3.8-27b`, multimodal, 131K context. Returns a
-  factual observation (`scene`, `activity`, `people_count`, `risk_signals`,
-  `confidence`, `notes`) and **is never shown the local verdict**, so it cannot
-  echo the answer back. It is also told not to pick a risk level or an action;
-  that is the other agent's job. It uses `strict: false` structured outputs
-  because Groq only offers advisory schema enforcement for this model, so
-  `parse_observation` still has to tolerate an occasional malformed reply.
-- **`DecisionAgent`** — `openai/gpt-oss-120b`, text only, ~500 tps. Sees the
-  observation plus the detector measurements and returns an independent verdict
-  plus `alert_message`. It uses `strict: true`, which is constrained decoding
-  that **guarantees** the reply matches the schema, so a malformed verdict is
-  not a failure mode. It is also never shown the local verdict.
+The deterministic rule gate also runs when `--agent llm` is selected. The
+optional LLM mode is separate and still uses `OPENAI_API_KEY`; it does not
+create Telegram alerts. Without `GROQ_API_KEY`, a qualifying local rule event
+uses the `AI review unavailable` fallback. Without Telegram credentials, the
+application records the delivery failure in `logs/verification.csv` but cannot
+send a message.
 
-Switch `DECISION_MODEL` to `openai/gpt-oss-20b` for a cheaper, weaker
-alternative, or change `VISION_MODEL` to another Groq multimodal model — the
-only hard requirement is that it accepts image input. Both agents degrade to
-`insufficient_output` on any failure, which routes to human review instead of
-killing the video loop.
+### Review records and limits
 
-### Non-blocking verification
+`logs/verification.csv` records the local rule decision, AI status, alert type,
+risk, summary, model latency, and Telegram delivery status. The review runs on
+one background worker so video capture continues while Groq and Telegram are
+responding. Repeated frames for the same event are deduplicated by the rule
+action cooldown. If the bounded queue is full, the event is logged as
+`review_queue_full`.
 
-With `VERIFY_ASYNC=1` (default) the verifier runs on a single worker thread and
-the video loop keeps reading frames instead of stalling for the duration of
-both agent calls. Verdicts are picked up on a later frame, and each one carries
-the evidence and decision from the frame that produced it. Only the newest
-pending frame is verified — a stale frame is not worth two slow LLM calls.
-
-Set `VERIFY_ASYNC=0` to verify inline (the original behavior), which blocks
-the loop for up to `2 * VERIFY_TIMEOUT_SECONDS`.
-
-`VERIFY_LATENCY_TARGET_MS` defaults to 2000 because both agents run on Groq at
-roughly 450-500 tps, so decode time should be well under a second.
-
-### Evidence delivery
-
-`wa.me` links are text-only, so a plain escalation message can only carry a
-file path. Set `EVIDENCE_SERVER_ENABLED=1` and `EVIDENCE_PUBLIC_HOST=<your
-LAN IP>` to start a small static server on `frames/` — the message then
-carries a tappable link so the authority sees the photo on their phone
-(same network required). Off by default.
-
-### Safety and limits
-
-This layer only notifies designated humans via `AUTHORITY_WHATSAPP_NUMBER`,
-`AUTHORITY_PHONE_NUMBER` and `REVIEWER_WHATSAPP_NUMBER` (digits only, country
-code included) — it still does **not** contact emergency services, and neither
-agent ever places a call or sends a message on its own. WhatsApp receiving is
-out of scope: `wa.me` is send-only, so approve/reject happens in the console.
-
-Set `ESCALATION_DRY_RUN=1` to print the links instead of opening them, or
-`VERIFY_ENABLED=0` to turn the whole layer off. If either agent call is slower
-than `VERIFY_TIMEOUT_SECONDS` it is treated as a failure and routed to human
-review rather than stalling the video loop.
+This is a student prototype. Fall, fight-like movement, crowd density, and
+inactivity are candidate signals; lighting, occlusion, dancing, and ordinary
+movement can produce errors. A human must review alerts and choose any
+response.

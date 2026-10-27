@@ -1,6 +1,6 @@
 """
-Entry point: wires video input -> pose estimation -> tracking -> detectors
--> decision agent -> action executor into a real-time loop.
+Entry point: wires video capture -> local detectors -> deterministic event gate
+-> event clips -> Groq review -> Telegram notification.
 
 Run:
     python main.py --source webcam --agent rule
@@ -24,8 +24,6 @@ from config import (
 	AGENT_CALL_EVERY_N_FRAMES,
 	AGENT_MODEL,
 	AGENT_TEMPERATURE,
-	AUTHORITY_PHONE_NUMBER,
-	AUTHORITY_WHATSAPP_NUMBER,
 	CLIP_DIR,
 	CLIP_SECONDS,
 	CAMERA_FPS,
@@ -34,11 +32,6 @@ from config import (
 	DENSITY_MEDIUM,
 	DISPLAY_WINDOW,
 	ESCALATE_ON_AGREED_HIGH,
-	ESCALATION_COOLDOWN_SECONDS,
-	ESCALATION_DRY_RUN,
-	EVIDENCE_PUBLIC_HOST,
-	EVIDENCE_SERVER_ENABLED,
-	EVIDENCE_SERVER_PORT,
 	FALL_ANGLE_THRESHOLD,
 	FALL_MIN_FRAMES,
 	FALL_MIN_DROP_RATIO,
@@ -58,8 +51,6 @@ from config import (
 	MOTION_HISTORY,
 	OPENAI_API_KEY,
 	RECENT_EVENT_HISTORY,
-	REVIEW_REQUEST_COOLDOWN_SECONDS,
-	REVIEWER_WHATSAPP_NUMBER,
 	RISK_HIGH_STREAK_FRAMES,
 	SAVE_CLIP_ON_HIGH_RISK,
 	SAVE_SCREENSHOT_ON_HIGH_RISK,
@@ -122,7 +113,7 @@ def build_judge():
 	if not VERIFY_ENABLED:
 		return None
 	if not GROQ_API_KEY:
-		print("[INFO] GROQ_API_KEY not set; second-opinion verification disabled")
+		print("[INFO] GROQ_API_KEY not set; event review will use deterministic fallback")
 		return None
 
 	try:
@@ -188,7 +179,7 @@ def local_candidate_key(context):
     for alert_type, evidence in candidates:
         if evidence:
             first = evidence[0] if isinstance(evidence, list) else {}
-            return alert_type, first.get("track_id") if isinstance(first, dict) else None
+            return alert_type, first.get("track_id", first.get("id")) if isinstance(first, dict) else None
     return "uncertain", None
 
 
@@ -247,6 +238,7 @@ def drain_incident_results(incident_pipeline, verification_logger, event_logger)
 
 
 def request_human_approval(local_decision, verify_result, evidence, reviewer_notifier=None):
+	"""Legacy single-frame console prompt; the event-review loop does not call it."""
 	print("[HUMAN REVIEW] VLM verification needs a decision.")
 	print(
 		f"  Local verdict : risk={local_decision['risk_level']} "
@@ -265,7 +257,7 @@ def request_human_approval(local_decision, verify_result, evidence, reviewer_not
 	if evidence.get("clip_path"):
 		print(f"  Clip          : {evidence['clip_path']}")
 
-	# Send-only heads-up to the reviewer's WhatsApp; they answer in the console.
+	# Legacy WhatsApp heads-up for the single-frame console approval path.
 	if reviewer_notifier is not None and reviewer_notifier.request_review(
 		local_decision, verify_result, evidence
 	):
@@ -282,7 +274,7 @@ def request_human_approval(local_decision, verify_result, evidence, reviewer_not
 def handle_verify_result(verify_result, decision, evidence, frame_id, notifier,
                          reviewer_notifier, action_executor, event_logger,
                          verification_logger):
-	"""Applies the decision matrix to one finished verdict.
+	"""Legacy single-frame decision handler; the event loop uses Telegram results.
 
 	Shared by the inline and async paths so latency warnings, HITL review,
 	escalation, execution and logging behave identically no matter how the
@@ -326,7 +318,7 @@ def handle_verify_result(verify_result, decision, evidence, frame_id, notifier,
 
 
 def handle_unverified_decision(decision, evidence, frame, notifier, action_executor, event_logger):
-	"""Runs the pre-verification behavior for a decision no judge reviewed.
+	"""Legacy single-frame local handler; the event loop uses Telegram results.
 
 	Keeps local rules self-sufficient: with verification disabled, unconfigured,
 	or simply not applicable (low risk), alerts and escalation behave exactly as

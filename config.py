@@ -86,21 +86,11 @@ RISK_HIGH_STREAK_FRAMES = _get_int("RISK_HIGH_STREAK_FRAMES", 30)
 ACTION_COOLDOWN_SECONDS = _get_int("ACTION_COOLDOWN_SECONDS", 10)
 
 # ---------------------------------------------------------------------------
-# Groq agentic second-opinion verifier. The local rules stay the decision
-# authority; a vision agent (Qwen) looks at the actual snapshot frame plus the
-# detector context, a decision agent (GPT-OSS) turns that into an independent
-# {risk_level, action, reasoning, alert_message} JSON, and that verdict is
-# compared against the local decision. Never dispatches emergency services.
-#
-# GROQ_API_KEY = one key covers both agents, from console.groq.com/keys
-# VISION_MODEL = multimodal, must accept image input. qwen/qwen3.8-27b is
-#                Groq's Qwen vision model; it has a 131K context window.
-# DECISION_MODEL = text only, needs reliable structured output.
-#                openai/gpt-oss-120b has full strict:true support.
-#                openai/gpt-oss-20b is the cheaper, weaker alternative.
-#
-# VERIFY_ASYNC runs the agents on a worker thread so the video loop keeps
-# reading frames instead of stalling for the duration of both calls.
+# Groq event reviewer. The deterministic RuleBasedAgent gates event review;
+# Qwen sees three sampled event frames plus detector context, then GPT-OSS
+# returns alert type, risk, and summary. Both models share GROQ_API_KEY.
+# The MP4 stays local until Telegram sends it to the configured human reviewer.
+# VERIFY_ENABLED disables Groq review but keeps deterministic fallback alerts.
 # ---------------------------------------------------------------------------
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 GROQ_BASE_URL = os.getenv("GROQ_BASE_URL", "https://api.groq.com/openai/v1").strip().rstrip("/")
@@ -109,30 +99,21 @@ DECISION_MODEL = os.getenv("DECISION_MODEL", "openai/gpt-oss-120b").strip()
 VERIFY_TEMPERATURE = _get_float("VERIFY_TEMPERATURE", 0.0)
 VISION_MAX_TOKENS = _get_int("VISION_MAX_TOKENS", 700)
 DECISION_MAX_TOKENS = _get_int("DECISION_MAX_TOKENS", 700)
-# Hard network budget for one agent call. Exceeding it counts as a failed
-# verification and routes to human review instead of hanging the loop.
+# Per-request timeout; a Groq failure routes the deterministic candidate to Telegram.
 VERIFY_TIMEOUT_SECONDS = _get_float("VERIFY_TIMEOUT_SECONDS", 10.0)
 # Warn when a completed verification exceeds this. Groq runs at ~450-500 tps,
 # so both agents together should land well under a second of decode time.
 VERIFY_LATENCY_TARGET_MS = _get_int("VERIFY_LATENCY_TARGET_MS", 2000)
 VERIFY_ENABLED = _get_bool("VERIFY_ENABLED", True)
-# Agentic verification fires only on HIGH risk that has been sustained for at
-# least this long. Brief spikes (a single fall frame, a momentary density
-# jump) run the normal local path with no network call, which is both cheaper
-# and quieter. 0.0 verifies every high-risk frame the moment it appears.
+# Legacy single-frame verifier threshold; the event-review path is gated by
+# a non-none deterministic rule action and does not use this setting.
 VERIFY_MIN_HIGH_RISK_SECONDS = _get_float("VERIFY_MIN_HIGH_RISK_SECONDS", 2.0)
-# Runs both agents on a worker thread so the video loop keeps reading frames
-# instead of stalling for two sequential network calls per verification.
+# Legacy single-frame verifier setting; event review always uses a worker queue.
 VERIFY_ASYNC = _get_bool("VERIFY_ASYNC", True)
 
 # ---------------------------------------------------------------------------
-# Escalation: notify a designated human reviewer via wa.me + tel: links.
-# This is NOT emergency dispatch. Numbers must be digits only, with country
-# code (e.g. 919876543210). Leave empty to disable the matching channel.
-#
-# AUTHORITY_*  receives the escalation (high-risk evidence).
-# REVIEWER_*   receives the "please evaluate this" request when the VLM
-#              disagrees or fails; they answer via the console prompt.
+# Legacy manual-link escalation settings. The live event-review route uses
+# Telegram and does not open WhatsApp/tel links or ask for console approval.
 # ---------------------------------------------------------------------------
 AUTHORITY_WHATSAPP_NUMBER = os.getenv("AUTHORITY_WHATSAPP_NUMBER", "").strip()
 AUTHORITY_PHONE_NUMBER = os.getenv("AUTHORITY_PHONE_NUMBER", "").strip()
@@ -143,15 +124,17 @@ ESCALATION_DRY_RUN = _get_bool("ESCALATION_DRY_RUN", False)
 HITL_PROMPT_ENABLED = _get_bool("HITL_PROMPT_ENABLED", True)
 # Reuse a cooldown so a repeating failure cannot spam the reviewer.
 REVIEW_REQUEST_COOLDOWN_SECONDS = _get_int("REVIEW_REQUEST_COOLDOWN_SECONDS", 60)
+
+# ---------------------------------------------------------------------------
+# Telegram reviewer notifications
+# ---------------------------------------------------------------------------
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 TELEGRAM_TIMEOUT_SECONDS = _get_int("TELEGRAM_TIMEOUT_SECONDS", 10)
 
 # ---------------------------------------------------------------------------
-# Evidence server: wa.me messages are text-only, so this tiny LAN static
-# server makes the screenshot a tappable link instead of a bare file path.
-# OFF by default. When on, the URL uses EVIDENCE_PUBLIC_HOST (your machine's
-# LAN IP) so the authority's phone on the same network can open the photo.
+# Legacy evidence-server settings for manual-link helpers; unused by the
+# Telegram event-review route.
 # ---------------------------------------------------------------------------
 EVIDENCE_SERVER_ENABLED = _get_bool("EVIDENCE_SERVER_ENABLED", False)
 EVIDENCE_SERVER_PORT = _get_int("EVIDENCE_SERVER_PORT", 8090)

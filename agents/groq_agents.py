@@ -1,21 +1,10 @@
-"""Agentic verification layer on Groq: a vision agent and a decision agent.
+"""Groq agents for three-frame event observation and structured decisions.
 
-Both agents share one Groq API key and speak the OpenAI chat protocol, so the
-client is the standard openai SDK pointed at https://api.groq.com/openai/v1.
-
-The split matters because the two jobs need different capabilities:
-
-- VisionAgent   -> qwen/qwen3.8-27b. Multimodal, so it can actually see the
-  snapshot. It returns a factual observation and is deliberately NOT shown the
-  local YOLO/CNN verdict, so it cannot simply echo the answer back.
-- DecisionAgent -> openai/gpt-oss-120b. Text only, but a stronger reasoner with
-  guaranteed schema-constrained output. It turns the observation into an
-  independent {risk_level, action, reasoning} plus alert_message, the
-  plain-language text the authority reads first in WhatsApp.
-
-The local YOLO/CNN decision stays the authority; these agents are the second
-opinion compared against it in agents/verifier.py. Nothing here contacts
-emergency services.
+Both models share one GROQ_API_KEY through the OpenAI-compatible Groq endpoint.
+Qwen describes what is visible across before/event/after frames; GPT-OSS turns
+that observation and the deterministic detector context into an alert type,
+risk level, and short summary. Legacy single-frame verifier methods remain
+available for compatibility with older callers.
 """
 import base64
 
@@ -104,7 +93,7 @@ DECISION_SYSTEM_PROMPT = (
     "Never recommend calling or dispatching emergency services. This system "
     "only notifies a designated human reviewer.\n"
     "Write alert_message as the plain-language incident summary a human reads "
-    "first in a WhatsApp message: what was seen, why it is a concern, and what "
+    "first in a human-review notification: what was seen, why it is a concern, and what "
     "should happen next. Keep it under 60 words, factual, and free of blame or "
     "speculation about who anyone is. When the risk is low, say so in one "
     "sentence.\n"

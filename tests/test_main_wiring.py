@@ -1,11 +1,16 @@
 import csv
 import unittest
 from tempfile import TemporaryDirectory
+from pathlib import Path
+from types import SimpleNamespace
+
+import numpy as np
 from unittest.mock import patch
 
 import main
 from agents.rule_agent import RuleBasedAgent
 from agents.verifier import INSUFFICIENT
+from utils.telegram_notifier import TelegramNotifier
 from utils.verification_logger import VerificationLogger
 
 CONTEXT = {"crowd": {"count": 2, "density": 0.1, "level": "low"}, "falls": []}
@@ -322,6 +327,8 @@ class TestRuleEventGate(unittest.TestCase):
         self.assertEqual(main.local_candidate_key(context), ("crowd_density", None))
         context["crowd"]["level"] = "low"
         self.assertEqual(main.local_candidate_key(context), ("inactivity", 8))
+        context["falls"] = [{"id": 7}]
+        self.assertEqual(main.local_candidate_key(context), ("possible_fall", 7))
 
     def test_inactivity_rule_creates_a_deterministic_candidate(self):
         decision = RuleBasedAgent().analyze({
@@ -354,6 +361,130 @@ class TestEventVerificationLogging(unittest.TestCase):
         self.assertEqual(rows[0]["summary"], "Person on floor.")
         self.assertEqual(rows[1]["outcome"], "agreement_high")
         self.assertTrue(all(len(row) == len(VerificationLogger.FIELDS) for row in rows))
+
+
+
+class FakeEventLoopVideo:
+    fps = 2
+
+    def __init__(self):
+        self.frames = [np.full((2, 2, 3), index, dtype=np.uint8) for index in range(9)]
+        self.read_count = 0
+        self.released = False
+
+    def get_frame(self):
+        if self.read_count >= len(self.frames):
+            return None
+        frame = self.frames[self.read_count]
+        self.read_count += 1
+        return frame
+
+    def release(self):
+        self.released = True
+
+
+class FakePipelineReviewLogger:
+    instance = None
+
+    def __init__(self, log_dir):
+        self.rows = []
+        type(self).instance = self
+
+    def log_event_result(self, result):
+        self.rows.append(result)
+
+
+class FakeGroqEventReviewer:
+    def __init__(self):
+        self.image_counts = []
+
+    def review_event_encoded(self, images, context):
+        self.image_counts.append(len(images))
+        return {
+            "status": "ok",
+            "model_decision": {
+                "alert_type": "possible_fall",
+                "risk_level": "high",
+                "summary": "A person appears to be on the ground.",
+            },
+            "reason": "",
+            "latency_ms": 25.0,
+            "model": "fake-gpt-oss",
+        }
+
+
+class FakeTelegramEventNotifier:
+    def __init__(self):
+        self.calls = []
+
+    def send_event(self, decision, clip_path, timestamp):
+        caption = TelegramNotifier.build_caption(decision, timestamp)
+        self.calls.append((decision, clip_path, caption))
+        return {"video_sent": True, "text_sent": False, "error": ""}
+
+
+class TestMainEventLoop(unittest.TestCase):
+    def test_rule_candidate_runs_fake_groq_then_sends_clip_to_telegram(self):
+        video = FakeEventLoopVideo()
+        verifier = FakeGroqEventReviewer()
+        notifier = FakeTelegramEventNotifier()
+        event_logger = FakeEventLogger()
+        frame_number = 0
+
+        def fake_process_frame(frame, pipeline, clip_buffer):
+            nonlocal frame_number
+            frame_number += 1
+            falls = [{"id": 7}] if frame_number == 5 else []
+            events = [{"type": "fall", "data": falls[0]}] if falls else []
+            density = {"count": 1, "density": 0.1, "level": "low"}
+            return [], [], events, density, falls, [], []
+
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            def fake_write_clip(frames, event_id):
+                clip_path = root / "clips" / "event.mp4"
+                clip_path.write_bytes(b"fake-mp4")
+                return str(clip_path)
+
+            args = SimpleNamespace(
+                source="webcam", camera=0, agent="rule", device=None,
+                model=None, imgsz=None, no_display=True,
+            )
+            with patch.object(main, "parse_args", return_value=args), \
+                 patch.object(main, "resolve_pose_profile", return_value=("fake", "cpu", 32)), \
+                 patch.object(main, "VideoSource") as source_cls, \
+                 patch.object(main, "build_pipeline", return_value=()), \
+                 patch.object(main, "process_frame", side_effect=fake_process_frame), \
+                 patch.object(main, "EventLogger", return_value=event_logger), \
+                 patch.object(main, "VerificationLogger", FakePipelineReviewLogger), \
+                 patch.object(main, "build_judge", return_value=verifier), \
+                 patch.object(main, "build_telegram_notifier", return_value=notifier), \
+                 patch.object(main, "LOG_DIR", root / "logs"), \
+                 patch.object(main, "FRAME_DIR", root / "frames"), \
+                 patch.object(main, "CLIP_DIR", root / "clips"), \
+                 patch.object(main, "CLIP_SECONDS", 4), \
+                 patch.object(main, "DISPLAY_WINDOW", False), \
+                 patch.object(main, "SAVE_SCREENSHOT_ON_HIGH_RISK", False), \
+                 patch.object(main, "AGENT_CALL_EVERY_N_FRAMES", 100), \
+                 patch.object(main.ClipBuffer, "_write_event_clip", side_effect=fake_write_clip):
+                source_cls.from_webcam.return_value = video
+                main.main()
+                clip_exists = Path(notifier.calls[0][1]).is_file()
+
+        self.assertEqual(video.read_count, 9)
+        self.assertTrue(video.released)
+        self.assertEqual(verifier.image_counts, [3])
+        self.assertEqual(len(notifier.calls), 1)
+        decision, clip_path, caption = notifier.calls[0]
+        self.assertTrue(clip_path.endswith("event.mp4"))
+        self.assertTrue(clip_exists)
+        self.assertIn("possible_fall", decision["alert_type"])
+        self.assertIn("Alert type: possible_fall", caption)
+        self.assertIn("Risk: high", caption)
+        self.assertIn("A person appears to be on the ground.", caption)
+        self.assertEqual(len(FakePipelineReviewLogger.instance.rows), 1)
+        self.assertEqual(FakePipelineReviewLogger.instance.rows[0]["frame_id"], 5)
+
 
 if __name__ == "__main__":
     unittest.main()

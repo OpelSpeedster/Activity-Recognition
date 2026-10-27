@@ -1,23 +1,9 @@
-"""Second-opinion verifier built from two Groq agents.
+"""Groq event reviewer with compatibility methods for older single-frame calls.
 
-The local rule agent stays the decision authority. The verifier runs an
-observation agent over the actual snapshot, hands that observation to a
-separate decision agent, and returns an independent
-{risk_level, action, reasoning, alert_message} verdict that is compared against
-the local decision:
-
-- agreement + high risk        -> auto-escalate to a designated reviewer
-- disagreement                 -> human-in-the-loop console approval
-- invalid/missing model output -> human-in-the-loop console approval
-
-The public contract is the same as the old Modal-backed verifier (verify /
-verify_encoded returning {agreement, model_decision, reason, latency_ms,
-model}) so the pipeline and the decision matrix in agents/verifier.py did not
-have to change. Two fields are new: `alert_message` is the WhatsApp text
-composed by the decision agent, and `observation` is kept for the logs.
-
-Never raises: any failure degrades to INSUFFICIENT so the pipeline routes to
-human review instead of dying on the video loop.
+The event path runs Qwen on three sampled images, then GPT-OSS on the visual
+observation and detector context. Its result contains a typed alert decision;
+all failures return an error result so the asynchronous pipeline can use the
+local deterministic candidate.
 """
 import time
 
@@ -43,7 +29,7 @@ __all__ = [
 
 
 class GroqVerifier:
-    """Runs the vision agent then the decision agent over one snapshot."""
+    """Runs event review or the legacy one-image compatibility path."""
 
     def __init__(self, api_key, vision_model=DEFAULT_VISION_MODEL,
                  decision_model=DEFAULT_DECISION_MODEL, base_url="",
