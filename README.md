@@ -168,7 +168,7 @@ The event-review path runs after the deterministic `RuleBasedAgent` returns an
 action other than `none`. It creates an event-centered clip using
 `CLIP_SECONDS` (3 seconds by default), then samples an image from before, at,
 and after the candidate event. Qwen reviews those three images plus detector
-context; GPT-OSS returns an alert type, risk level, and short summary. The
+context and returns an alert type, risk level, and short summary. The
 MP4 is sent to Telegram, not to Groq.
 
 Low-risk decisions are logged without a Telegram alert. Medium- and high-risk
