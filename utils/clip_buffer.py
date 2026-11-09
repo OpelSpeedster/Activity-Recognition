@@ -8,11 +8,11 @@ import cv2
 
 
 def sample_event_frames(frames, trigger_index, pre_count, post_count):
-    """Return frames sampled before, at, and after the event trigger."""
-    before_index = trigger_index - pre_count
-    after_index = trigger_index + post_count
-    if before_index < 0 or trigger_index < 0 or after_index >= len(frames):
-        raise ValueError("event clip is missing a temporal phase")
+    """Return three ordered samples, clamping to available video edges."""
+    if not frames or trigger_index < 0 or trigger_index >= len(frames):
+        raise ValueError("event clip does not contain a valid trigger frame")
+    before_index = max(0, trigger_index - max(0, pre_count))
+    after_index = min(len(frames) - 1, trigger_index + max(0, post_count))
     return [frames[before_index], frames[trigger_index], frames[after_index]]
 
 

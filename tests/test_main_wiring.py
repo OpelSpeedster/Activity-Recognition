@@ -222,7 +222,7 @@ class TestShouldVerify(unittest.TestCase):
 
 
 class TestJudgeSelection(unittest.TestCase):
-    """The judge is the Groq two-agent verifier; None means no second opinion."""
+    """The event judge is a single Qwen VLM call; None disables review."""
 
     def test_disabled_returns_none(self):
         with patch.object(main, "VERIFY_ENABLED", False):
@@ -236,13 +236,12 @@ class TestJudgeSelection(unittest.TestCase):
     def test_builds_groq_verifier_with_configured_models(self):
         with patch.object(main, "VERIFY_ENABLED", True), \
              patch.object(main, "GROQ_API_KEY", "groq-a.b"), \
-             patch.object(main, "VISION_MODEL", "test-vision"), \
-             patch.object(main, "DECISION_MODEL", "test-decision"):
+             patch.object(main, "VISION_MODEL", "test-vision"):
             judge = main.build_judge()
         self.assertEqual(type(judge).__name__, "GroqVerifier")
         self.assertEqual(judge.vision.model, "test-vision")
-        self.assertEqual(judge.decision.model, "test-decision")
-        self.assertEqual(judge.model, "test-decision")
+        self.assertEqual(judge.decision.model, "test-vision")
+        self.assertEqual(judge.model, "test-vision")
 
     def test_constructor_failure_returns_none(self):
         # A bad key shape must not kill startup; verification just drops out.
@@ -409,7 +408,7 @@ class FakeGroqEventReviewer:
             },
             "reason": "",
             "latency_ms": 25.0,
-            "model": "fake-gpt-oss",
+            "model": "fake-qwen",
         }
 
 

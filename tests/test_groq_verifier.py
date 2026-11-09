@@ -19,8 +19,7 @@ def fake_response(content):
 def make_verifier():
     verifier = GroqVerifier(
         "groq-test-key",
-        vision_model="test-vision",
-        decision_model="test-decision",
+        vision_model="qwen/qwen3.8-27b",
         base_url="https://example.invalid/v1",
     )
     verifier.vision.client = MagicMock()
@@ -88,8 +87,8 @@ class TestGroqVerifierInit(unittest.TestCase):
     def test_default_models_come_from_the_agentic_layer(self):
         verifier = GroqVerifier("groq-test-key")
         self.assertEqual(verifier.vision.model, "qwen/qwen3.8-27b")
-        self.assertEqual(verifier.decision.model, "openai/gpt-oss-120b")
-        self.assertEqual(verifier.model, "openai/gpt-oss-120b")
+        self.assertEqual(verifier.decision.model, "qwen/qwen3.8-27b")
+        self.assertEqual(verifier.model, "qwen/qwen3.8-27b")
 
     def test_both_agents_share_one_endpoint(self):
         verifier = make_verifier()
@@ -103,8 +102,8 @@ class TestVerify(unittest.TestCase):
         self.assertEqual(result["agreement"], AGREEMENT)
         self.assertEqual(result["model_decision"]["risk_level"], "high")
         self.assertGreaterEqual(result["latency_ms"], 0.0)
-        self.assertEqual(result["model"], "test-decision")
-        self.assertEqual(result["vision_model"], "test-vision")
+        self.assertEqual(result["model"], "qwen/qwen3.8-27b")
+        self.assertEqual(result["vision_model"], "qwen/qwen3.8-27b")
 
     def test_disagreement(self):
         result = stub(make_verifier(), decision_json=LOW_JSON).verify(
@@ -202,17 +201,13 @@ class TestExports(unittest.TestCase):
 class FakeVision:
     def __init__(self, fail=False):
         self.fail = fail
+        self.calls = 0
 
-    def observe_frames_encoded(self, images, context):
+    def classify_event_encoded(self, images, context):
+        self.calls += 1
         if self.fail:
             raise RuntimeError("vision unavailable")
         self.seen = (images, context)
-        return {"scene": "hall", "activity": "person on floor", "risk_signals": ["possible fall"]}
-
-
-class FakeDecision:
-    def classify_event(self, observation, context):
-        self.seen = (observation, context)
         return {"alert_type": "possible_fall", "risk_level": "high", "summary": "Person on the floor."}
 
 
@@ -220,17 +215,16 @@ class TestGroqEventReview(unittest.TestCase):
     def make_verifier(self, vision):
         verifier = GroqVerifier.__new__(GroqVerifier)
         verifier.vision = vision
-        verifier.decision = FakeDecision()
-        verifier.model = "fake-decision"
+        verifier.model = "qwen/qwen3.8-27b"
         return verifier
 
-    def test_review_event_passes_all_three_images_then_observation(self):
+    def test_review_event_uses_one_qwen_judgment_for_three_images(self):
         vision = FakeVision()
         verifier = self.make_verifier(vision)
         context = {"falls": [{"track_id": 7}]}
         result = verifier.review_event_encoded(["A", "B", "C"], context)
-        self.assertEqual(vision.seen[0], ["A", "B", "C"])
-        self.assertEqual(verifier.decision.seen[0], result["observation"])
+        self.assertEqual(vision.calls, 1)
+        self.assertEqual(vision.seen, (["A", "B", "C"], context))
         self.assertEqual(result["model_decision"]["alert_type"], "possible_fall")
 
     def test_review_event_returns_error_if_vision_fails(self):

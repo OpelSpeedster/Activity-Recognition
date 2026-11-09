@@ -11,12 +11,17 @@ from agents.rule_agent import RuleBasedAgent
 
 
 class CrowdSafetyAgent:
-    def __init__(self, api_key, model="gpt-4o-mini", temperature=0.2):
+    def __init__(self, api_key, model="gpt-4o-mini", temperature=0.2,
+                 base_url=None, provider="LLM"):
         if not api_key:
-            raise ValueError("OPENAI_API_KEY is missing")
-        self.client = OpenAI(api_key=api_key)
+            raise ValueError(f"{provider} API key is missing")
+        client_options = {"api_key": api_key}
+        if base_url:
+            client_options["base_url"] = base_url
+        self.client = OpenAI(**client_options)
         self.model = model
         self.temperature = temperature
+        self.provider = provider
 
     def _build_prompt(self, context):
         crowd = context.get("crowd", {})
@@ -104,3 +109,29 @@ class CrowdSafetyAgent:
         decision = RuleBasedAgent().analyze(context)
         decision["reasoning"] = llm_suggestion["reasoning"]
         return decision
+
+
+
+class FallbackCrowdSafetyAgent:
+    """Try the primary provider first, then the configured secondary provider."""
+
+    def __init__(self, primary, secondary=None):
+        self.primary = primary
+        self.secondary = secondary
+
+    def analyze(self, context):
+        if self.primary is None:
+            if self.secondary is None:
+                raise RuntimeError("No LLM provider is configured")
+            return self.secondary.analyze(context)
+
+        try:
+            return self.primary.analyze(context)
+        except Exception as primary_error:
+            if self.secondary is None:
+                raise
+            print(
+                f"[WARN] {self.primary.provider} agent call failed "
+                f"({type(primary_error).__name__}); trying {self.secondary.provider} fallback."
+            )
+            return self.secondary.analyze(context)

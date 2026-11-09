@@ -4,8 +4,8 @@ from unittest.mock import MagicMock
 
 from agents.groq_agents import (
     DECISION_SCHEMA,
-    DEFAULT_DECISION_MODEL,
     DEFAULT_VISION_MODEL,
+    EVENT_DECISION_SCHEMA,
     GROQ_BASE_URL,
     VISION_SCHEMA,
     DecisionAgent,
@@ -13,6 +13,7 @@ from agents.groq_agents import (
     build_context_summary,
     encode_frame_jpeg,
     parse_decision,
+    parse_event_decision,
     parse_observation,
     render_observation,
 )
@@ -47,6 +48,11 @@ DECISION_JSON = (
     '"alert_message": "A person is lying on the corridor floor. Please check now."}'
 )
 
+EVENT_DECISION_JSON = (
+    '{"alert_type":"possible_fall","risk_level":"high",'
+    '"summary":"A person appears to be on the floor."}'
+)
+
 VALID_OBSERVATION = parse_observation(OBSERVATION_JSON)
 
 
@@ -57,9 +63,8 @@ def make_agent(agent_cls, model):
 
 
 class TestDefaults(unittest.TestCase):
-    def test_models_are_live_groq_ids(self):
+    def test_qwen_is_the_only_groq_review_model(self):
         self.assertEqual(DEFAULT_VISION_MODEL, "qwen/qwen3.8-27b")
-        self.assertEqual(DEFAULT_DECISION_MODEL, "openai/gpt-oss-120b")
 
     def test_base_url_is_groq(self):
         self.assertTrue(GROQ_BASE_URL.startswith("https://api.groq.com/"))
@@ -223,12 +228,14 @@ class TestVisionAgent(unittest.TestCase):
         self.assertEqual(observation["confidence"], "medium")
 
     def test_observe_uses_vision_model_and_advisory_schema(self):
-        agent = make_agent(VisionAgent, "test-vision")
+        agent = make_agent(VisionAgent, "qwen/qwen3.8-27b")
         agent.client.chat.completions.create.return_value = fake_response(OBSERVATION_JSON)
         agent.observe_encoded("QUJD", FALL_CONTEXT)
 
         kwargs = agent.client.chat.completions.create.call_args.kwargs
-        self.assertEqual(kwargs["model"], "test-vision")
+        self.assertEqual(kwargs["model"], "qwen/qwen3.8-27b")
+        self.assertEqual(kwargs["reasoning_effort"], "none")
+        self.assertEqual(kwargs["response_format"]["json_schema"]["name"], "qwen_qwen3_8-27b")
         self.assertFalse(kwargs["response_format"]["json_schema"]["strict"])
         self.assertEqual(kwargs["response_format"]["json_schema"]["schema"], VISION_SCHEMA)
 
@@ -269,13 +276,15 @@ class TestDecisionAgent(unittest.TestCase):
         self.assertEqual(decision["risk_level"], "high")
         self.assertIn("corridor", decision["alert_message"])
 
-    def test_decide_uses_strict_schema(self):
-        agent = make_agent(DecisionAgent, "test-decision")
+    def test_decide_uses_qwen_strict_schema(self):
+        agent = make_agent(DecisionAgent, "qwen/qwen3.8-27b")
         agent.client.chat.completions.create.return_value = fake_response(DECISION_JSON)
         agent.decide(VALID_OBSERVATION, FALL_CONTEXT)
 
         kwargs = agent.client.chat.completions.create.call_args.kwargs
-        self.assertEqual(kwargs["model"], "test-decision")
+        self.assertEqual(kwargs["model"], "qwen/qwen3.8-27b")
+        self.assertEqual(kwargs["reasoning_effort"], "none")
+        self.assertEqual(kwargs["response_format"]["json_schema"]["name"], "qwen_qwen3_8-27b")
         self.assertTrue(kwargs["response_format"]["json_schema"]["strict"])
         self.assertEqual(kwargs["response_format"]["json_schema"]["schema"], DECISION_SCHEMA)
 
@@ -300,12 +309,20 @@ class TestEventReview(unittest.TestCase):
             "data:image/jpeg;base64,CCC",
         ])
 
-    def test_event_decision_parser_validates_type_risk_and_summary(self):
-        from agents.groq_agents import parse_event_decision
-        decision = parse_event_decision(
-            '{"alert_type":"possible_fall","risk_level":"high",'
-            '"summary":"A person appears to be on the ground."}'
-        )
+    def test_qwen_judges_three_frames_with_a_single_structured_call(self):
+        agent = make_agent(VisionAgent, "qwen/qwen3.8-27b")
+        agent.client.chat.completions.create.return_value = fake_response(EVENT_DECISION_JSON)
+        decision = agent.classify_event_encoded(["AAA", "BBB", "CCC"], FALL_CONTEXT)
+
+        kwargs = agent.client.chat.completions.create.call_args.kwargs
+        images = [
+            part for part in kwargs["messages"][1]["content"]
+            if part["type"] == "image_url"
+        ]
+        self.assertEqual(len(images), 3)
+        self.assertEqual(kwargs["model"], "qwen/qwen3.8-27b")
+        self.assertTrue(kwargs["response_format"]["json_schema"]["strict"])
+        self.assertEqual(kwargs["response_format"]["json_schema"]["schema"], EVENT_DECISION_SCHEMA)
         self.assertEqual(decision["alert_type"], "possible_fall")
         self.assertEqual(decision["risk_level"], "high")
         self.assertTrue(decision["summary"])

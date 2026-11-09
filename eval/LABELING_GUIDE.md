@@ -16,14 +16,30 @@ fight,300,340,2
 fight,300,340,3
 ```
 
-- `event_type`: `fall` or `fight` (these are the only event types the current
-  real-video evaluator scores)
+- `event_type`: `fall`, `fight`, or `crowd_density` (these are the event types
+  the current real-video evaluator scores). A crowd-density interval means a
+  sustained, visibly tightly packed crowd; ordinary groups of pedestrians do
+  not count. The detector uses normalized person count, so its thresholds need
+  calibration for each camera and resolution.
 - `start_frame` / `end_frame`: the frame range where the event is actually
   happening (open the video in VLC or any player with frame-step, note the
   frame numbers — most players show timestamp; multiply by fps to get frame
   number, or use `ffprobe`/`opencv` frame counter)
-- `person_id`: optional — only fill in if you're also checking tracker ID
-  correctness. Leave blank if you only care about "did *a* fall happen".
+- `person_id`: optional; see the scoring policy below.
+
+## Scoring policy
+
+The evaluator matches events of the same type when their labeled and predicted
+frame ranges overlap, allowing a default boundary tolerance of 10 frames.
+Each prediction and each label can match at most once; unmatched predictions
+count as false positives and unmatched labels count as false negatives.
+Repeated detector hits for the same person are grouped into one episode, and
+the episode closes after more than two frames without another hit. Use
+--tolerance-frames N to change the timing allowance for a video.
+
+When both a label and prediction include a person ID, their IDs must match.
+Leave the label ID blank to score whether the event was detected regardless of
+which person was involved.
 
 ## How to make one quickly (10-15 min per clip)
 

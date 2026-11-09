@@ -10,7 +10,10 @@ Usage:
 """
 from detectors.fall_detector import FallDetector
 from detectors.fight_detector import FightDetector
-from eval.metrics import Event, evaluate_events, summarize, print_report, accumulate_events
+from eval.metrics import (
+    Event, evaluate_events, summarize, print_report,
+    accumulate_events, finalize_open_events,
+)
 from eval.synthetic_scenarios import ALL_SCENARIOS
 
 
@@ -29,9 +32,7 @@ def run_scenario(name, scenario_fn):
         accumulate_events(predictions, open_events, "fall", falls, frame_id)
         accumulate_events(predictions, open_events, "fight", fights, frame_id)
 
-    last_frame = len(frames)
-    for (etype, pid), start in open_events.items():
-        predictions.append(Event(etype, start, last_frame, pid))
+    finalize_open_events(predictions, open_events)
 
     return ground_truth, predictions
 
@@ -57,7 +58,11 @@ def main():
     print("\n=== Aggregate across all synthetic scenarios ===")
     fall_results = [r for r in all_results if r.event_type == "fall"]
     fight_results = [r for r in all_results if r.event_type == "fight"]
-    print_report("ALL SCENARIOS", [summarize(fall_results), summarize(fight_results)], summarize(all_results))
+    print_report(
+        "ALL SCENARIOS",
+        [summarize(fall_results, "fall"), summarize(fight_results, "fight")],
+        summarize(all_results, "overall"),
+    )
 
 
 if __name__ == "__main__":

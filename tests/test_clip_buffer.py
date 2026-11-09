@@ -18,9 +18,23 @@ class TestSampleEventFrames(unittest.TestCase):
         samples = sample_event_frames(frames, trigger_index=4, pre_count=4, post_count=4)
         self.assertEqual([int(frame[0, 0, 0]) for frame in samples], [0, 4, 8])
 
-    def test_rejects_missing_temporal_phase(self):
+    def test_rejects_invalid_trigger_index(self):
         with self.assertRaises(ValueError):
-            sample_event_frames([marker(0), marker(1)], 1, pre_count=1, post_count=1)
+            sample_event_frames([marker(0), marker(1)], 2, pre_count=1, post_count=1)
+
+    def test_clamps_samples_to_video_edges(self):
+        frames = [marker(i) for i in range(6)]
+        beginning = sample_event_frames(frames, 1, pre_count=4, post_count=4)
+        ending = sample_event_frames(frames, 4, pre_count=4, post_count=4)
+        self.assertEqual([int(frame[0, 0, 0]) for frame in beginning], [0, 1, 5])
+        self.assertEqual([int(frame[0, 0, 0]) for frame in ending], [0, 4, 5])
+
+    def test_repeats_nearest_sample_at_video_boundaries(self):
+        frames = [marker(i) for i in range(3)]
+        beginning = sample_event_frames(frames, 0, pre_count=4, post_count=1)
+        ending = sample_event_frames(frames, 2, pre_count=1, post_count=4)
+        self.assertEqual([int(frame[0, 0, 0]) for frame in beginning], [0, 0, 1])
+        self.assertEqual([int(frame[0, 0, 0]) for frame in ending], [1, 2, 2])
 
 
 class TestClipBuffer(unittest.TestCase):
